@@ -5,6 +5,8 @@ const state = {
   calibrations: [], compareCalibrations: [], region: null,
   edit: null, cornerDraft: [], startProbe: null,
   draftResult: null, activeTab: "capture",
+  candidateDecisions: new Map(), candidateControl: null, candidateRefresh: 0,
+  reviewLocked: false,
   records: [], record: null, checkedRecords: new Set(),
   requestSerial: 0, recordSerial: 0, currentSearch: 0,
 };
@@ -411,7 +413,31 @@ async function displayTool() {
 function invalidateDraft() {
   state.draftResult = null;
   state.requestSerial++;
+  state.candidateDecisions.clear();
+  state.candidateControl = null;
   $("save-report").disabled = true;
+}
+
+function defaultDecisions(control) {
+  const decisions = new Map();
+  for (const item of control.items || []) {
+    decisions.set(item.id, item.decision === "excluded" ? "excluded" : "confirmed");
+  }
+  return decisions;
+}
+
+function retainedIds(control) {
+  return (control.items || [])
+    .filter((item) => state.candidateDecisions.get(item.id) === "confirmed")
+    .map((item) => item.id);
+}
+
+function draftWithDecisions(body) {
+  const control = state.candidateControl;
+  if (!control || !state.draftResult) return body;
+  const options = {...body.options};
+  options[control.option] = retainedIds(control);
+  return {...body, options};
 }
 
 function currentRequest() {
@@ -454,15 +480,28 @@ function currentRequest() {
 async function runReport(save) {
   const serial = ++state.requestSerial;
   const capture = state.capture;
-  const body = save && state.draftResult ? state.draftResult : currentRequest();
+  const reuse = save && state.draftResult;
+  const base = reuse ? state.draftResult : currentRequest();
+  const body = reuse ? draftWithDecisions(base) : base;
   const focused = save ? $("save-report") : $("preview");
   focused.disabled = true;
   notice(save ? "正在保存本次检查…" : "正在处理采集图…");
   try {
     const reply = await post(`/api/captures/${capture.id}/analysis`, {...body, save});
     if (serial !== state.requestSerial || capture.id !== state.capture?.id) return;
-    showReport($("report"), reply.result || reply);
-    state.draftResult = body;
+    const result = reply.result || reply;
+    const control = result.controls;
+    if (control) {
+      const fresh = !state.candidateControl || !state.candidateDecisions.size ||
+        ![...control.items].every((item) => state.candidateDecisions.has(item.id));
+      if (fresh) state.candidateDecisions = defaultDecisions(control);
+      state.candidateControl = control;
+    } else {
+      state.candidateDecisions.clear();
+      state.candidateControl = null;
+    }
+    showReport($("report"), result, save ? reply.record?.id : undefined);
+    state.draftResult = base;
     $("save-report").disabled = save;
     notice(save ? "检查已保存，可以在复核与交接中打开。" : "");
     if (save) {
@@ -472,6 +511,22 @@ async function runReport(save) {
   } finally {
     if (save) $("save-report").disabled = !state.draftResult;
     else $("preview").disabled = false;
+  }
+}
+
+async function refreshCandidateDecisions() {
+  if (!state.draftResult || !state.candidateControl) return;
+  const serial = ++state.candidateRefresh;
+  const capture = state.capture;
+  const body = draftWithDecisions(state.draftResult);
+  notice("正在按当前确认状态重绘…");
+  try {
+    const reply = await post(`/api/captures/${capture.id}/analysis`, {...body, save: false});
+    if (serial !== state.candidateRefresh || capture.id !== state.capture?.id) return;
+    showReport($("report"), reply.result || reply);
+    notice("");
+  } catch (error) {
+    notice(error.message, true);
   }
 }
 
@@ -489,6 +544,23 @@ const labels = {
   dry_patches: "样本格数", source_error_x_px: "横向误差 px", source_error_y_px: "纵向误差 px",
   panel_mm: "面板毫米长度", panel_px: "面板物理像素长度", source_px: "原相机像素长度",
   dark_capture_id: "暗场标识", flat_capture_id: "平场标识", fit_rmse: "拟合均方根误差",
+  along_axis: "明暗递变方向", polarity: "保留跳变方向", candidate_count: "候选数",
+  confirmed_count: "已确认", excluded_count: "已排除", step_threshold_code: "最小跳变码值",
+  max_transition_width_samples: "突变宽度上限（采样点）", sample_size_panel_px: "采样尺寸（面板像素）",
+  neighbour_profiles_required: "所需佐证剖面数", minimum_visible_lines: "最短可见段剖面数",
+  merge_tolerance_samples: "位置合并容差（采样点）", profiles_used: "使用剖面数",
+  profiles_skipped: "跳过剖面数", smooth_transitions_ignored: "未计入的平滑过渡",
+  local_features_ignored: "未计入的孤立亮点", step_map_scale: "跳变图色标",
+  candidate: "候选", direction: "方向", step_code: "跳变量（码值）",
+  step_recorded_counts: "跳变量（计数）", step_percent_full_scale: "满量程 %",
+  step_mad: "跳变离散", panel_position: "面板位置", panel_offset_px: "面板位置 px",
+  transition_width_samples: "宽度（采样点）", width_panel_px: "宽度 px",
+  visible_segments: "可见段", run_count: "可见段数", visible_from: "可见起点",
+  visible_to: "可见终点", visible_panel_px: "可见长度 px", supported_lines: "佐证剖面",
+  span_lines: "段内剖面", line_coverage_pct: "剖面覆盖 %", camera_x: "相机 X",
+  camera_y: "相机 Y", box: "提示框（面板坐标）", decision: "确认状态",
+  kind: "类别", reason: "原因", profiles: "涉及剖面", first_line: "首个剖面",
+  last_line: "末个剖面",
 };
 
 function valueText(value) {
@@ -497,6 +569,66 @@ function valueText(value) {
   if (Array.isArray(value)) return value.map(valueText).join(" / ");
   if (typeof value === "object") return Object.entries(value).map(([key, inner]) => `${labels[key] || key} · ${valueText(inner)}`).join("，");
   return String(value);
+}
+
+function candidateReview(control) {
+  const locked = state.reviewLocked;
+  const card = node("section", null, {class: "candidate-review"});
+  const header = node("header");
+  header.append(
+    node("h3", locked ? "候选确认（已保存记录）" : "候选确认"),
+    node("p", locked ? "这是一条已保存的记录，显示当时每项候选的状态。" :
+      "保存前逐项点选：保留你认为真实存在的跳变。排除的候选不会进入条带列表，但会保留在表格中。",
+      {class: "muted"}),
+  );
+  card.append(header);
+  const saved = locked;
+  const list = node("div", null, {class: "candidate-list"});
+  for (const item of control.items || []) {
+    const decision = saved ? (item.decision || "candidate") : state.candidateDecisions.get(item.id);
+    const row = node("div", null, {class: `candidate-row ${decision}`});
+    const text = node("div", null, {class: "candidate-text"});
+    const arrow = item.direction === "bright" ? "往亮 +" : "往暗 −";
+    text.append(
+      node("b", `${item.id} · ${arrow}`),
+      node("small", `跳变 ${item.step >= 0 ? "+" : ""}${Number(item.step).toFixed(4)} · ` +
+        `宽度约 ${Number(item.width).toFixed(2)} 采样点 · 位置 ${Number(item.position).toFixed(3)} · ` +
+        `剖面 ${item.supported}/${item.span}`),
+      node("small", (item.segments || []).map((seg) => seg.map((v) => Number(v).toFixed(3)).join("–")).join("，"),
+        {class: "muted"}),
+    );
+    row.append(text);
+    if (saved) {
+      const tag = decision === "confirmed" ? "已确认" : decision === "excluded" ? "已排除" : "未确认";
+      row.append(node("span", tag, {class: `candidate-tag ${decision}`}));
+    } else {
+      const keep = node("button", "保留", {type: "button", class: "button compact quiet"});
+      const drop = node("button", "排除", {type: "button", class: "button compact quiet"});
+      keep.setAttribute("aria-pressed", String(decision === "confirmed"));
+      drop.setAttribute("aria-pressed", String(decision === "excluded"));
+      const choose = (next) => {
+        state.candidateDecisions.set(item.id, next);
+        for (const button of [keep, drop]) {
+          const active = button === (next === "confirmed" ? keep : drop);
+          button.setAttribute("aria-pressed", String(active));
+        }
+        row.classList.toggle("confirmed", next === "confirmed");
+        row.classList.toggle("excluded", next === "excluded");
+        refreshCandidateDecisions();
+      };
+      keep.addEventListener("click", () => choose("confirmed"));
+      drop.addEventListener("click", () => choose("excluded"));
+      const buttons = node("div", null, {class: "inline-actions"});
+      buttons.append(keep, drop);
+      row.append(buttons);
+    }
+    list.append(row);
+  }
+  if (!(control.items || []).length) {
+    list.append(node("p", "这次没有可确认的候选。", {class: "muted"}));
+  }
+  card.append(list);
+  return card;
 }
 
 function showReport(destination, report, savedRecord) {
@@ -517,6 +649,10 @@ function showReport(destination, report, savedRecord) {
     const warnings = node("ul", null, {class: "warning-list"});
     warnings.append(...report.warnings.map((item) => node("li", item)));
     destination.append(warnings);
+  }
+  if (report.controls?.kind === "candidate-review") {
+    state.reviewLocked = Boolean(savedRecord);
+    destination.append(candidateReview(report.controls));
   }
   const images = node("div", null, {class: "report-gallery"});
   const files = node("div", null, {class: "inline-actions"});

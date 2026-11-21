@@ -170,6 +170,7 @@ class Report:
     rows: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     files: dict[str, tuple[bytes, str]] = field(default_factory=dict)
+    controls: dict | None = None
 
     def add(self, name: str, data: bytes, mime: str) -> None:
         if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,70}", name) or PurePath(name).name != name:
@@ -198,13 +199,16 @@ class Report:
         self.add(name, content.getvalue().encode("utf-8-sig"), "text/csv")
 
     def as_json(self) -> dict:
-        return {
+        result = {
             "title": self.title,
             "summary": self.summary,
             "metrics": self.metrics,
             "rows": self.rows,
             "warnings": self.warnings,
         }
+        if self.controls is not None:
+            result["controls"] = self.controls
+        return result
 
 
 def rectification(scene: Scene, comparison: Scene | None, region: Region, options: dict) -> Report:
@@ -228,6 +232,7 @@ def rectification(scene: Scene, comparison: Scene | None, region: Region, option
 
 def tool_config() -> dict:
     from .assays import configs as light_configs
+    from .banding import configs as banding_configs
     from .response import configs as response_configs
     from .structure import configs as structure_configs
     from .calibration_tools import configs as calibration_configs
@@ -251,6 +256,7 @@ def tool_config() -> dict:
             ],
         },
         **light_configs(),
+        **banding_configs(),
         **response_configs(),
         **structure_configs(),
         **calibration_configs(),

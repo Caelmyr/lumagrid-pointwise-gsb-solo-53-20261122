@@ -46,3 +46,18 @@ dialog{border:1px solid var(--border);border-radius:10px;max-width:570px;width:c
 @media(max-width:1060px){.workspace{grid-template-columns:210px minmax(0,1fr)}.workgrid{grid-template-columns:minmax(0,1fr)}.tool-actions{justify-content:start}.tool-panel{grid-template-columns:repeat(2,minmax(0,1fr))}.tool-panel>h2,.tool-panel>p,.tool-panel>div{grid-column:1/-1}}
 @media(max-width:720px){.workspace{grid-template-columns:1fr}.library{max-height:340px}.masthead{height:auto;min-height:58px;padding:10px 12px}.brand>span:last-child,.online{display:none}.main{padding:15px 10px}.tabs{gap:12px}.image-frame{padding:7px;min-height:190px}.records-grid,.tool-panel{grid-template-columns:1fr}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.report-gallery{grid-template-columns:1fr}}
 .packet-members{display:grid;gap:7px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin:5px 0 10px}.packet-members label{background:#f1f6f6;border-radius:6px;padding:6px 9px}.spaced-form{margin-top:13px}
+
+/* Candidate review for previewed inspections */
+.candidate-review{margin:13px 0;border:1px solid #cfe0db;border-radius:8px;background:#f4faf8;padding:13px 15px}
+.candidate-review header p{font-size:.85rem;margin-top:4px}
+.candidate-list{display:grid;gap:7px;margin-top:9px}
+.candidate-row{display:flex;align-items:center;justify-content:space-between;gap:10px;border:1px solid #d8e5e1;border-radius:6px;background:#fff;padding:7px 10px}
+.candidate-row.excluded{opacity:.62;border-style:dashed;background:#f6f8f8}
+.candidate-text{display:grid;gap:1px;min-width:0}
+.candidate-text small{font-size:.76rem;color:var(--soft)}
+.candidate-row .inline-actions{gap:5px;flex-shrink:0}
+.candidate-row .button[aria-pressed=true]{background:var(--teal);border-color:var(--teal);color:#fff}
+.candidate-tag{font-size:.75rem;font-weight:700;border-radius:4px;padding:3px 7px;white-space:nowrap}
+.candidate-tag.confirmed{background:#dff3ec;color:#125145}
+.candidate-tag.excluded{background:#eceff0;color:#5b6a71}
+.candidate-tag.candidate{background:#fff2dd;color:#714a11}
