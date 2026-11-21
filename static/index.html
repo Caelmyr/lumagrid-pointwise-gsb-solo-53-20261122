@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>LumaGrid · 面板光学台</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" type="module"></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="brand" href="/" aria-label="LumaGrid 首页"><span class="glyph" aria-hidden="true"><i></i><i></i><i></i><i></i></span><b>LumaGrid</b><span>面板光学台</span></a>
+    <div class="masthead-actions"><span class="online" id="online">连接本地资料库</span><button id="load-demo" class="button quiet">打开合成演示</button></div>
+  </header>
+  <main class="workspace">
+    <aside class="library">
+      <div class="library-title"><h2>面板资料库</h2><button class="button compact quiet" id="new-panel">新建</button></div>
+      <label class="search">查找面板<input id="panel-search" placeholder="面板编号或工位"></label>
+      <nav id="panels" aria-label="面板"></nav>
+      <div id="capture-section" hidden>
+        <div class="library-title spaced"><h2>相机采集</h2><button class="button compact quiet" id="new-capture">导入</button></div>
+        <label class="search">按采集角色筛选<select id="capture-filter"><option value="">所有角色</option></select></label>
+        <nav id="captures" aria-label="采集"></nav>
+      </div>
+    </aside>
+    <section class="main">
+      <div id="notice" role="status" hidden></div>
+      <section id="empty" class="empty">
+        <div class="empty-mark" aria-hidden="true"></div>
+        <h1>从面板开始</h1>
+        <p>建立面板，导入相机采集，再从相机标定、亮度与清晰度工具生成检查报告。</p>
+        <button id="empty-demo" class="button primary">打开合成演示</button>
+      </section>
+      <div id="workbench" hidden>
+        <div class="page-heading">
+          <div>
+            <div class="eyebrow" id="station"></div>
+            <h1 id="panel-title"></h1>
+            <p class="muted" id="panel-summary"></p>
+          </div>
+          <span class="sample" id="synthetic" hidden>合成采集</span>
+        </div>
+        <nav class="tabs" aria-label="工作区">
+          <button class="active" data-tab="capture">检查工作台</button>
+          <button data-tab="records">复核与交接</button>
+          <button data-tab="timing">时钟配对</button>
+          <button data-tab="backdrop">镜头校正</button>
+          <button data-tab="intake">采集包</button>
+        </nav>
+        <section class="tab-panel" id="tab-capture">
+          <div class="workgrid">
+            <section class="stage-panel">
+              <div class="stage-bar"><div><h2 id="capture-title">相机视图</h2><p id="capture-meta" class="muted"></p></div><a class="button compact quiet" id="download-original" hidden>原始图</a></div>
+              <div class="image-frame" id="image-frame">
+                <p id="no-capture" class="muted">先在左边导入或选择一张图。</p>
+                <div id="image-wrap" hidden><img id="camera-image" alt="相机采集"><svg viewBox="0 0 1000 1000" preserveAspectRatio="none" id="image-overlay" aria-hidden="true"></svg></div>
+              </div>
+              <div class="stage-control" id="stage-control" hidden>
+                <label>查看标定<select id="revision"></select></label>
+                <button id="edit-corners" class="button quiet">标定四角</button>
+                <button id="select-region" class="button quiet">框选分析范围</button>
+                <button id="clear-region" class="button quiet">全部面板</button>
+              </div>
+              <div class="inline-edit" id="calibration-edit" hidden>
+                <p>在相机图上依次点左上、右上、右下、左下。点击可从第一点重新放置。</p>
+                <label>标定备注<input id="calibration-note" maxlength="400"></label>
+                <button id="save-corners" class="button primary" disabled>保存标定</button>
+                <button id="cancel-corners" class="button quiet">取消</button>
+              </div>
+              <div class="region-readout" id="region-readout" hidden></div>
+            </section>
+            <section class="tool-panel" id="tool-panel">
+              <h2>检查工具</h2>
+              <label>检查项目<select id="tool"></select></label>
+              <p class="muted" id="tool-description"></p>
+              <label id="compare-field" hidden>对照采集<select id="comparison"></select></label>
+              <label id="compare-revision-field" hidden>对照图标定<select id="compare-revision"></select></label>
+              <div id="options"></div>
+              <div class="tool-actions"><button class="button primary" id="preview">运行检查</button><button class="button quiet" id="save-report" disabled>保存复核记录</button></div>
+            </section>
+          </div>
+          <section id="report" class="report" hidden></section>
+        </section>
+        <section class="tab-panel" id="tab-records" hidden>
+          <div class="records-grid">
+            <section class="records-list">
+              <h2>检查记录</h2>
+              <label>复核状态<select id="record-filter"><option value="">所有状态</option></select></label>
+              <div id="records"></div>
+              <form id="bundle-form" method="post">
+                <label class="check-line"><input type="checkbox" name="includes_sources" value="1" checked>随交接包附上原图</label>
+                <button class="button primary" type="submit" id="bundle-download" disabled>下载已选交接包</button>
+              </form>
+            </section>
+            <div id="record-detail" class="records-detail"><p class="muted">选择一条记录，查看当时的图像和标定版本。</p></div>
+          </div>
+          <section class="subpanel">
+            <h2>验证交接包</h2>
+            <form id="verify-form" class="inline-actions" enctype="multipart/form-data"><label>选择 ZIP 文件<input name="archive" type="file" accept=".zip" required></label><button class="button quiet">检查内容哈希</button></form>
+            <p id="verify-result" class="muted"></p>
+          </section>
+        </section>
+        <section class="tab-panel" id="tab-timing" hidden>
+          <form id="timing-form" class="session-form">
+            <h2>采集时钟配对</h2>
+            <p class="muted">粘贴参考设备 CSV，至少包含 timestamp、event 字段。timestamp 使用带时区的 ISO 8601。</p>
+            <button class="button quiet compact" id="fill-demo-log" type="button">填入演示参考日志</button>
+            <label>参考日志<textarea name="reference_csv" rows="8" required spellcheck="false"></textarea></label>
+            <div class="form-grid">
+              <label>配对方式<select name="mode"><option value="manual">使用给定偏移</option><option value="estimate">从参考记录估算</option></select></label>
+              <label>相机标识（可选）<input name="camera"></label>
+              <label>与相机相加的偏移（毫秒）<input name="offset_ms" type="number" value="0" step=".1"></label>
+              <label>偏移搜索范围（毫秒）<input name="offset_bound_ms" type="number" value="1000"></label>
+              <label>时间容差（毫秒）<input name="margin_ms" type="number" value="38"></label>
+              <label>亮度差容差<input name="level_margin" type="number" min="0" max="1" value=".08" step=".01"></label>
+            </div>
+            <div class="inline-actions"><button class="button primary" name="preview">预览配对</button><button class="button quiet" name="save">保存复核记录</button></div>
+          </form>
+          <section id="timing-report" class="report" hidden></section>
+        </section>
+        <section class="tab-panel" id="tab-backdrop" hidden>
+          <form id="flatfield-form" class="session-form">
+            <h2>暗平场校正</h2>
+            <p class="muted">选择同一相机和曝光设置下拍摄的镜头暗场与镜头平场。保存时在当前面板生成一张派生图。</p>
+            <div class="form-grid">
+              <label>被处理采集<select name="source"></select></label>
+              <label>镜头暗场<select name="dark"></select></label>
+              <label>镜头平场<select name="flat"></select></label>
+              <label>最低平场与暗场差值<input name="minimum" type="number" value=".035" min=".005" max=".3" step=".005"></label>
+              <label>派生采集名称<input name="title" maxlength="80" placeholder="背景已校正"></label>
+            </div>
+            <div class="inline-actions"><button class="button primary" name="preview">预览校正</button><button class="button quiet" name="save">存为派生采集</button></div>
+          </form>
+          <section id="flatfield-report" class="report" hidden></section>
+        </section>
+        <section class="tab-panel" id="tab-intake" hidden>
+          <form id="packet-export" class="session-form" method="post">
+            <h2>打包原始采集</h2>
+            <p class="muted">选择原图并一起保存其采集属性、内容哈希及当前标定版本。</p>
+            <div class="packet-members" id="packet-members"></div>
+            <div><button class="button primary" id="packet-download" disabled>下载 ZIP</button></div>
+          </form>
+          <form id="packet-import" class="session-form spaced-form" enctype="multipart/form-data">
+            <h2>导入采集包</h2>
+            <label>从本地导出的采集 ZIP<input name="bundle" type="file" accept=".zip" required></label>
+            <div class="inline-actions"><button class="button primary" name="preview">预检采集包</button><button class="button quiet" name="save" disabled>导入通过预检的采集</button></div>
+          </form>
+          <section id="packet-report" class="report" hidden></section>
+        </section>
+      </div>
+    </section>
+  </main>
+  <dialog id="panel-dialog">
+    <form class="dialog-form" id="panel-form">
+      <h2>新建面板</h2>
+      <div class="form-grid">
+        <label>面板编号<input name="name" required maxlength="80" autofocus></label>
+        <label>工位<input name="station" maxlength="80"></label>
+        <label>物理像素宽<input name="native_width" type="number" min="16" max="16384" required></label>
+        <label>物理像素高<input name="native_height" type="number" min="16" max="16384" required></label>
+        <label>有效宽度（毫米）<input name="width_mm" type="number" min="1" step=".01"></label>
+        <label>有效高度（毫米）<input name="height_mm" type="number" min="1" step=".01"></label>
+      </div>
+      <label>备注<textarea name="note" rows="2" maxlength="1000"></textarea></label>
+      <label class="check-line"><input name="synthetic" type="checkbox">标记为合成用料</label>
+      <div class="inline-actions"><button class="button primary">保存面板</button><button class="button quiet" type="button" data-close="panel-dialog">取消</button></div>
+    </form>
+  </dialog>
+  <dialog id="capture-dialog">
+    <form class="dialog-form" id="capture-form" enctype="multipart/form-data">
+      <h2>导入采集</h2>
+      <label>相机图像<input name="image" type="file" required accept=".png,.jpg,.jpeg,.tif,.tiff"></label>
+      <div class="form-grid">
+        <label>采集名称<input name="title" maxlength="80"></label>
+        <label>采集角色<select id="upload-role" name="role"></select></label>
+        <label>相机标识<input name="camera" maxlength="80"></label>
+        <label>快门（毫秒）<input name="shutter_ms" type="number" step=".001" min=".001"></label>
+        <label>ISO<input name="iso" type="number" min="1"></label>
+        <label>观察角（度）<input name="angle_deg" type="number" min="-90" max="90" step=".1"></label>
+        <label>图案亮度（0～1）<input name="level" type="number" min="0" max="1" step=".01"></label>
+        <label>带时区的采集时间<input name="captured_at" placeholder="2026-05-12T12:05:00+08:00"></label>
+      </div>
+      <label>备注<textarea name="note" maxlength="1000" rows="2"></textarea></label>
+      <div class="inline-actions"><button class="button primary">导入图像</button><button class="button quiet" type="button" data-close="capture-dialog">取消</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

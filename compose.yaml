@@ -1,0 +1,22 @@
+name: solo56-lumagrid
+services:
+  web:
+    build:
+      context: .
+      args:
+        LUMAGRID_DEPENDENCY_IMAGE: ${LUMAGRID_DEPENDENCY_IMAGE:-python:3.11-slim}
+    image: ${LUMAGRID_IMAGE:-solo56-lumagrid:1.0}
+    init: true
+    network_mode: bridge
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LUMAGRID_PORT:-19956}:8000"
+    volumes:
+      - panel-library:/var/lib/lumagrid
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"]
+      interval: 8s
+      timeout: 4s
+      retries: 6
+volumes:
+  panel-library:
