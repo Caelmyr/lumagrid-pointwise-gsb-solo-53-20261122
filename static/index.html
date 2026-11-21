@@ -68,6 +68,13 @@
                 <button id="save-corners" class="button primary" disabled>保存标定</button>
                 <button id="cancel-corners" class="button quiet">取消</button>
               </div>
+              <div class="inline-edit" id="correction-edit" hidden>
+                <p>先运行“几何检查点校验”并勾选“内部参照修正”，在报告里核对四角与参照各自可用的区域和排除点，再保存为独立版本。</p>
+                <label>基于四角版本<input id="correction-base" readonly></label>
+                <label>修正备注<input id="correction-note" maxlength="400" placeholder="例如：中部参照局部修正"></label>
+                <button id="save-correction" class="button primary" disabled>保存为独立标定版本</button>
+                <button id="cancel-correction" class="button quiet" disabled>返回四角结果</button>
+              </div>
               <div class="region-readout" id="region-readout" hidden></div>
             </section>
             <section class="tool-panel" id="tool-panel">
@@ -78,6 +85,10 @@
               <label id="compare-revision-field" hidden>对照图标定<select id="compare-revision"></select></label>
               <div id="options"></div>
               <div class="tool-actions"><button class="button primary" id="preview">运行检查</button><button class="button quiet" id="save-report" disabled>保存复核记录</button></div>
+              <div class="tool-actions" id="correction-actions" hidden>
+                <button class="button primary" id="preview-correction">预览参照修正</button>
+                <button class="button quiet" id="open-correction">保存为标定版本…</button>
+              </div>
             </section>
           </div>
           <section id="report" class="report" hidden></section>

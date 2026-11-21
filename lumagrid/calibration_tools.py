@@ -2,13 +2,20 @@
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from PIL import Image, ImageDraw
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 from .assays import number, partition, tick
-from .geometry import apply_homography, estimate_homography, panel_coordinates, scaled_dimensions
+from .geometry import (
+    Calibration, apply_homography, estimate_homography, fit_internal_references, panel_coordinates,
+    sampling_grid, scaled_dimensions,
+)
 from .inspection import Report, Scene, make_plane, paired_plane
 from .model import Point, Problem, Region, boolean, numeric, sequence
-from .raster import code_statistics, heatmap, luma, masked_rgb, overlay_regions, png_bytes, rounding, side_by_side
+from .raster import (
+    code_statistics, heatmap, luma, masked_rgb, overlay_regions, png_bytes, rounding,
+    side_by_side,
+)
 
 
 def compare_alignment(scene: Scene, second: Scene, region: Region, options: dict) -> Report:
@@ -166,7 +173,102 @@ def fiducial_pairs(raw, panel: dict):
     return names, panel_points, camera_points
 
 
-def check_fiducials(scene: Scene, second, region: Region, options: dict) -> Report:
+def correction_proposal(
+    scene: Scene,
+    names: list[str],
+    panel_points: np.ndarray,
+    observations: np.ndarray,
+    source_scale: np.ndarray,
+    options: dict,
+) -> dict | None:
+    """Robust internal-reference field on the current four-corner version."""
+    if not boolean(options.get("internal_reference"), "内部参照修正", default=False):
+        return None
+    if scene.revision is None:
+        raise Problem("内部参照修正需要先保存四角标定，再在其基础上试算。")
+    if scene.uses_internal_reference:
+        raise Problem("当前查看的标定版本已经使用内部参照；请切换到对应四角版本再试算。")
+    base = Calibration.from_raw(scene.revision["corners"])
+    threshold = numeric(options.get("threshold"), "像素偏差提醒值", .25, 150, default=6)
+    reach = numeric(options.get("reach"), "内部参照影响范围", .18, .45, default=.30)
+    fit = fit_internal_references(
+        base, names, panel_points, observations, source_scale, threshold_px=threshold, reach=reach,
+    )
+    if fit.field is None:
+        return {"fit": fit, "calibration": None, "excluded": True, "base": base}
+    corrected = base.corrected(fit.field)
+    return {
+        "fit": fit,
+        "calibration": corrected,
+        "excluded": False,
+        "base": base,
+        "threshold_px": threshold,
+        "reach": reach,
+        "support_area_pct": corrected.reference_summary()["support_area_pct"],
+        "minimum_sampling": corrected.minimum_jacobian(),
+    }
+
+
+def _support_overlay(photo: Image.Image, support: np.ndarray, color=(129, 240, 213)) -> Image.Image:
+    width, height = photo.size
+    mask = Image.fromarray(np.clip(support * 255, 0, 255).astype(np.uint8), "L")
+    mask = mask.resize((width, height), Image.Resampling.BILINEAR)
+    tint = Image.new("RGB", photo.size, color)
+    return Image.composite(Image.blend(photo, tint, 0.30), photo, mask)
+
+
+def correction_figure(scene: Scene, proposal: dict, tolerance: int) -> Image.Image:
+    """Corner-only vs corner+reference; teal marks where references are used."""
+    width, height = scene.image.size
+    overlay = proposal["calibration"]
+    grid = panel_coordinates(96, 96, Region(0, 0, 1, 1))
+    support = overlay.support(grid)
+    photo = masked_rgb(scene.image.rgb, scene.image.valid)
+    panels = [photo, _support_overlay(photo, support)]
+    for index, calibration in enumerate((proposal["base"], overlay)):
+        canvas = panels[index]
+        draw = ImageDraw.Draw(canvas)
+        for i in range(len(proposal["_names"])):
+            for x, y, color in (
+                (*calibration.panel_to_camera(proposal["_panel_points"][i:i + 1])[0], (105, 173, 251)),
+                (*proposal["_observations"][i], (249, 169, 102)),
+            ):
+                half = tolerance / np.array([width - 1, height - 1], dtype=np.float64)
+                draw.ellipse(
+                    (max(0, (x - half[0]) * width), max(0, (y - half[1]) * height),
+                     min(width, (x + half[0]) * width), min(height, (y + half[1]) * height)),
+                    outline=color, width=2,
+                )
+        for i, record in enumerate(proposal["fit"].records):
+            if record["included"]:
+                continue
+            px, py = (proposal["_observations"][i] * [width - 1, height - 1])
+            span = int(np.clip(round(max(scene.image.size) / 90), 6, 26))
+            draw.line((px - span, py - span, px + span, py + span), fill=(246, 120, 120), width=2)
+            draw.line((px - span, py + span, px + span, py - span), fill=(246, 120, 120), width=2)
+        draw.text((8, 8), "原四角" if index == 0 else "四角+内部参照（青色为参照支撑区）",
+                  fill=(236, 241, 249))
+        panels[index] = canvas
+    return side_by_side(panels[0], panels[1])
+
+
+def correction_payload(proposal: dict) -> dict | None:
+    """JSON-safe summary of a proposal for the inspection snapshot."""
+    if proposal is None or proposal.get("excluded"):
+        return None
+    field = proposal["calibration"].field
+    return {
+        "field": field.describe(),
+        "threshold_px": proposal.get("threshold_px"),
+        "reach": proposal.get("reach"),
+        "support_area_pct": proposal.get("support_area_pct"),
+        "minimum_sampling": proposal.get("minimum_sampling"),
+        "summary": proposal["calibration"].reference_summary(),
+        "fit": proposal["fit"].records,
+    }
+
+
+def check_fiducials(scene: Scene, second, region: Region, options: dict) -> tuple[Report, dict | None]:
     names, panel_points, observations = fiducial_pairs(options.get("pairs"), scene.panel)
     expected = scene.calibration.panel_to_camera(panel_points)
     initial = observations - expected
@@ -179,11 +281,20 @@ def check_fiducials(scene: Scene, second, region: Region, options: dict) -> Repo
     rows = []
     boxes = []
     tolerance = int(np.clip(round(max(scene.image.size) / 190), 2, 12))
+    proposal = correction_proposal(scene, names, panel_points, observations, source_scale, options)
+    if proposal is not None:
+        proposal["_panel_points"] = panel_points
+        proposal["_names"] = names
+        proposal["_observations"] = observations
+    corrected = proposal["calibration"] if proposal and not proposal["excluded"] else None
+    corrected_points = corrected.panel_to_camera(panel_points) if corrected is not None else None
     for i, name in enumerate(names):
         sx, sy = expected[i]
         px, py = observations[i]
         error = float(np.linalg.norm(residual[i]))
         trial_error = float(np.linalg.norm((observations[i] - trial[i]) * source_scale)) if trial is not None else None
+        after_error = (float(np.linalg.norm((observations[i] - corrected_points[i]) * source_scale))
+                       if corrected_points is not None else None)
         record = {
             "label": name,
             "panel_x": rounding(panel_points[i, 0]), "panel_y": rounding(panel_points[i, 1]),
@@ -193,25 +304,138 @@ def check_fiducials(scene: Scene, second, region: Region, options: dict) -> Repo
             "source_error_y_px": rounding(residual[i, 1], 3),
             "source_distance_px": rounding(error, 3),
             "in_sample_fit_error_px": rounding(trial_error, 3) if trial_error is not None else None,
+            "base_reference_distance_px": rounding(error, 3),
+            "corrected_distance_px": rounding(after_error, 3) if after_error is not None else None,
         }
         rows.append(record)
         right, bottom = tolerance / source_scale
         boxes.append(((sx - right, sy - bottom, sx + right, sy + bottom), f"R{i + 1}",
                       (249, 169, 102) if error > threshold else (167, 232, 201)))
         boxes.append(((px - right, py - bottom, px + right, py + bottom), f"O{i + 1}", (105, 173, 251)))
+    if proposal and not proposal["excluded"]:
+        for i, fit_record in enumerate(proposal["fit"].records):
+            rows[i]["reference_included"] = fit_record["included"]
+            rows[i]["reference_reason"] = fit_record["reason"]
+            rows[i]["leave_one_out_px"] = fit_record["leave_one_out_px"]
+            rows[i]["local_correction_px"] = fit_record["correction_px"]
+        for i, fit_record in enumerate(proposal["fit"].records):
+            if fit_record["included"]:
+                continue
+            px, py = observations[i]
+            right, bottom = tolerance / source_scale
+            boxes.append(((px - right, py - bottom, px + right, py + bottom), f"X{i + 1}", (246, 120, 120)))
     metrics = {
         "base_calibration": scene.revision_id,
+        "geometry_model": "corners+internal-reference" if corrected is not None else "corners",
         "point_count": len(names),
         "max_point_deviation_px": max(record["source_distance_px"] for record in rows),
         "rms_camera_deviation_px": rounding(np.sqrt(np.mean(np.sum(residual ** 2, axis=1))), 4),
         "points_outside_reminder": sum(record["source_distance_px"] > threshold for record in rows),
     }
+    if proposal and not proposal["excluded"]:
+        fit = proposal["fit"]
+        included = int(fit.included.sum())
+        after = np.asarray([record["corrected_distance_px"] for record in rows])
+        metrics.update({
+            "reference_count": included,
+            "reference_excluded_count": len(names) - included,
+            "reference_correction_area_pct": proposal["support_area_pct"],
+            "reference_min_sampling": (
+                rounding(proposal["minimum_sampling"], 6)
+                if proposal["minimum_sampling"] is not None else None
+            ),
+            "rms_corrected_deviation_px": rounding(np.sqrt(np.mean(after ** 2)), 4),
+        })
     report = Report("几何检查点校验", "以手工对应点检查当前四角校准的定位偏差。", metrics, rows)
     report.image("geometry-checkpoints.png", overlay_regions(masked_rgb(scene.image.rgb, scene.image.valid), boxes))
     report.table("geometry-checkpoints.csv", rows)
     if trial is not None:
         report.warnings.append("试算残差来自用于拟合的同一批点，只作匹配诊断，不修改当前标定。")
-    return report
+    if proposal is not None:
+        if proposal["excluded"]:
+            report.warnings.append(proposal["fit"].warning or "内部参照不足，未生成修正。")
+        else:
+            for record in proposal["fit"].records:
+                if not record["included"]:
+                    report.warnings.append(
+                        f"参照 {record['label']} 未参与修正：{record['reason'] or '与周边趋势不符'}。"
+                    )
+            report.warnings.append(
+                "内部参照修正只覆盖参照点附近；其余区域仍沿用四角标定，"
+                "预览不会修改现有版本，保存后才会成为独立可选版本。"
+            )
+            if proposal["support_area_pct"] < 45:
+                report.warnings.append(
+                    f"参照集中在画面中部，仅 {proposal['support_area_pct']:.0f}% 面板获得修正；四角维持原四角结果。"
+                )
+            if proposal["minimum_sampling"] is not None and proposal["minimum_sampling"] <= 1e-4:
+                report.warnings.append("局部修正可能造成折叠，不能保存；请缩小影响范围或复核参照点。")
+            report.image("geometry-correction-preview.png", correction_figure(scene, proposal, tolerance))
+    payload = correction_payload(proposal) if proposal is not None else None
+    if payload is not None:
+        sampling = proposal["minimum_sampling"]
+        payload["savable"] = sampling is None or sampling > 1e-4
+    return report, payload
+
+
+def preview_correction(scene: Scene, proposal: dict) -> tuple[Report, dict]:
+    """Rasterize both geometry models for the operator to compare before saving."""
+    size = scaled_dimensions(*scene.image.size, maximum=720, limit_area=620_000)
+    grid = panel_coordinates(size[0], size[1], Region(0, 0, 1, 1))
+    base = proposal["base"]
+    overlay = proposal["calibration"]
+    first_rgb, first_valid = _sample_with(scene, base, grid)
+    second_rgb, second_valid = _sample_with(scene, overlay, grid)
+    support = overlay.support(grid)
+    ridge = side_by_side(
+        masked_rgb(first_rgb, first_valid),
+        masked_rgb(second_rgb, second_valid),
+    )
+    tinted = masked_rgb(
+        np.where((support >= 0.05)[..., None], second_rgb * (0.72 + 0.28 * support[..., None]), second_rgb),
+        second_valid,
+    )
+    diff = np.linalg.norm(second_rgb - first_rgb, axis=-1)
+    scale = max(0.01, float(np.percentile(diff[second_valid & first_valid], 98))) if np.any(second_valid & first_valid) else 1.0
+    metrics = {
+        "geometry_model": "corners+internal-reference",
+        "base_calibration_id": scene.base_revision,
+        "reference_points": int(len(overlay.field.panel)),
+        "reference_correction_area_pct": overlay.reference_summary()["support_area_pct"],
+        "corner_only_area_pct": overlay.reference_summary()["corner_only_area_pct"],
+        "reference_min_sampling": (rounding(proposal["minimum_sampling"], 6)
+                                   if proposal["minimum_sampling"] is not None else None),
+        "max_correction_pct": overlay.reference_summary()["max_correction_pct"],
+        "changed_region_p98": rounding(scale, 5),
+    }
+    report = Report(
+        "内部参照修正预览",
+        "左侧保持原四角展平，右侧叠加内部参照修正；浅色区仍有内部参照支撑，深色区沿用四角。",
+        metrics,
+    )
+    report.image("geometry-models.png", ridge)
+    report.image("geometry-where-used.png", tinted)
+    report.image("geometry-difference.png", heatmap(diff, second_valid & first_valid, 0, scale))
+    report.warnings.append("右图亮度随内部参照支撑减弱而降低，提示该处已回到四角结果。")
+    report.warnings.append("预览不写入任何版本；确认后保存为独立可选标定版本。")
+    return report, {
+        "base_calibration_id": scene.base_revision,
+        "field": overlay.field.describe(),
+        "threshold_px": proposal.get("threshold_px"),
+        "reach": proposal.get("reach"),
+        "summary": overlay.reference_summary(),
+        "fit": proposal["fit"].records,
+    }
+
+
+def _sample_with(scene: Scene, calibration: Calibration, grid: np.ndarray):
+    camera_points = calibration.panel_to_camera(grid)
+    coordinates, inside = sampling_grid(scene.image.valid.shape, camera_points)
+    planes = [
+        map_coordinates(face, coordinates, order=1, mode="nearest")
+        for face in scene.image.rgb.transpose(2, 0, 1)
+    ]
+    return np.stack(planes, axis=-1), inside
 
 
 def configs():
@@ -235,6 +459,8 @@ def configs():
                                      {"panel": [.81, .73], "camera": [.78, .69]},
                                      {"panel": [.19, .78], "camera": [.22, .76]}]},
                         number("threshold", "像素偏差提醒值", 6, .25, 150, .25),
-                        tick("test_fit", "同时看拟合偏差")],
+                        tick("test_fit", "同时看拟合偏差"),
+                        tick("internal_reference", "内部参照修正（试算）"),
+                        number("reach", "内部参照影响范围", .30, .18, .45, .01)],
         },
     }

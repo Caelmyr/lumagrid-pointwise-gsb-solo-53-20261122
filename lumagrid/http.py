@@ -2,15 +2,19 @@
 from base64 import b64encode
 from io import BytesIO
 from pathlib import Path
+import json
 import os
 import sqlite3
 
+import numpy as np
 from flask import Flask, Response, request, send_file
 from werkzeug.exceptions import HTTPException
 
-from .calibration_tools import flatfield_report
+from .calibration_tools import (
+    correction_proposal, fiducial_pairs, flatfield_report, preview_correction,
+)
 from .demo import demo_trigger_log, install as install_demo
-from .geometry import Calibration, segment_statistics
+from .geometry import Calibration, ResidualField, segment_statistics
 from .handoff import inspect_bundle_content, prepare_bundle
 from .inspection import Scene, execute, public_tools
 from .intake import MAX_CAPTURE_PACKET_BYTES, package_captures, packet_attempt_summary
@@ -21,6 +25,15 @@ from .model import (
 from .raster import MAX_SOURCE_BYTES, decode_asset
 from .storage import STATES, Store
 from .timing import timing_report
+
+
+def _same_field(first: dict, second: dict) -> bool:
+    keys = ("panel", "residual", "radius", "reach", "floor")
+    return all(
+        json.loads(json.dumps(first.get(key), sort_keys=True, default=str))
+        == json.loads(json.dumps(second.get(key), sort_keys=True, default=str))
+        for key in keys
+    )
 
 
 def args_json():
@@ -246,6 +259,55 @@ def create_app(data_root: Path | None = None):
             snapshot["tool"], title, snapshot, report.as_json(), report.files,
         )
         return {"record": saved, "result": report_preview(report, snapshot)}, 201
+
+    @app.post("/api/captures/<capture_id>/geometry-correction")
+    def geometry_correction(capture_id):
+        data = args_json()
+        revision_id = plain(data.get("calibration_id"), "角点校准", 64) or None
+        scene = Scene.load(store, capture_id, revision_id)
+        names, panel_points, observations = fiducial_pairs(data.get("pairs"), scene.panel)
+        scale = np.asarray(scene.image.size) - 1
+        options = {
+            "threshold": data.get("threshold", 6),
+            "reach": data.get("reach", .30),
+            "internal_reference": True,
+        }
+        proposal = correction_proposal(scene, names, panel_points, observations, scale, options)
+        if proposal is None or proposal["excluded"]:
+            raise Problem(proposal["fit"].warning if proposal else "请提供内部参照点。")
+        report, correction = preview_correction(scene, proposal)
+        if not boolean(data.get("save"), "保存标定版本", default=False):
+            return report_preview(report)
+        note = plain(data.get("note"), "修正说明", 400)
+        return save_correction(store, scene, correction, note), 201
+
+    def save_correction(store, scene, correction, note):
+        field = ResidualField.from_info(correction.get("field"))
+        if field is None:
+            raise Problem("内部参照修正内容不完整，未保存。")
+        base = Calibration.from_raw(scene.revision["corners"]) if scene.revision else Calibration.identity()
+        corrected = base.corrected(field)
+        overview = corrected.overview(scene.image.valid.shape)
+        if overview.get("minimum_local_sampling") is not None and overview["minimum_local_sampling"] <= 1e-4:
+            raise Problem("该修正会让局部采样折叠，请缩小影响范围或复核参照点。", 409)
+        base_id = scene.revision["id"] if scene.revision else "identity"
+        for entry in store.calibration_history(scene.capture["id"]):
+            internal = (entry.get("info") or {}).get("internal_reference")
+            if internal and _same_field(internal, correction["field"]):
+                raise Problem(
+                    f"这一版内部参照修正已在 v{entry['revision']} 保存，请在查看标定中直接选用。", 409
+                )
+        info = {
+            **overview,
+            "base_calibration_id": base_id,
+            "internal_reference": correction["field"],
+            "reference_threshold_px": correction.get("threshold_px"),
+            "reference_reach": correction.get("reach"),
+            "reference_points": correction.get("fit"),
+        }
+        return store.add_calibration(
+            scene.capture["id"], base.corners.tolist(), info, note or "内部参照局部修正",
+        )
 
     @app.post("/api/panels/<panel_id>/timing")
     def timing(panel_id):

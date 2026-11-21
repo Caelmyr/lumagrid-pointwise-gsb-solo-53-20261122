@@ -5,6 +5,7 @@ const state = {
   calibrations: [], compareCalibrations: [], region: null,
   edit: null, cornerDraft: [], startProbe: null,
   draftResult: null, activeTab: "capture",
+  correction: null,
   records: [], record: null, checkedRecords: new Set(),
   requestSerial: 0, recordSerial: 0, currentSearch: 0,
 };
@@ -172,12 +173,15 @@ async function selectCapture(capture) {
   state.cornerDraft = [];
   state.startProbe = null;
   state.draftResult = null;
+  state.correction = null;
+  closeCorrectionEditor();
   $("report").hidden = true;
   $("save-report").disabled = true;
   $("revision").replaceChildren();
   displayCapture();
   displayCaptureList();
   fillComparison();
+  syncCorrectionTools();
   localStorage.setItem("lumagrid.capture", capture.id);
   const payload = await json(`/api/captures/${capture.id}/calibrations`);
   if (state.capture?.id !== capture.id) return;
@@ -208,8 +212,11 @@ function displayCapture() {
 }
 
 function revisionChoices(entries) {
-  return entries.map((entry) => [entry.id, `v${entry.revision} · 覆盖 ${entry.info.coverage_pct}%`])
-    .concat([["identity", "整张相机图"]]);
+  return entries.map((entry) => {
+    const reference = entry.info?.internal_reference;
+    const model = reference ? `四角+参照 ${reference.points} 点` : "四角";
+    return [entry.id, `v${entry.revision} · ${model} · 覆盖 ${entry.info.coverage_pct}%`];
+  }).concat([["identity", "整张相机图"]]);
 }
 
 function setCalibrationList(entries, desired) {
@@ -257,6 +264,30 @@ function cornerPoints() {
   return state.calibrations.find((entry) => entry.id === $("revision").value)?.corners || UNIT;
 }
 
+function selectedRevision() {
+  return state.calibrations.find((entry) => entry.id === $("revision").value) || null;
+}
+
+function drawReferenceSupport(svg) {
+  const field = selectedRevision()?.info?.internal_reference;
+  if (!field?.panel?.length) return;
+  const transform = homography(UNIT, cornerPoints());
+  const bound = svgEl("g", {class: "reference-support"});
+  field.panel.forEach((point, index) => {
+    const radius = field.radius?.[index] ?? field.reach ?? .3;
+    // Support footprint in panel units, projected through the corner homography.
+    const [x, y] = remap(transform, point);
+    const horizontal = remap(transform, [point[0] + radius, point[1]]);
+    const vertical = remap(transform, [point[0], point[1] + radius]);
+    const rx = Math.max(5, Math.abs(horizontal[0] - x) * 1000);
+    const ry = Math.max(5, Math.abs(vertical[1] - y) * 1000);
+    bound.append(svgEl("ellipse", {
+      cx: x * 1000, cy: y * 1000, rx, ry, "data-index": index + 1,
+    }));
+  });
+  svg.append(bound);
+}
+
 function svgEl(tag, attributes) {
   const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
   for (const [key, value] of Object.entries(attributes)) el.setAttribute(key, value);
@@ -277,9 +308,12 @@ function drawOverlay() {
   }
   const points = state.edit === "corners" ? state.cornerDraft : cornerPoints();
   const csv = (values) => values.map(([x, y]) => `${x * 1000},${y * 1000}`).join(" ");
-  if (points.length > 1) svg.append(svgEl(points.length === 4 ? "polygon" : "polyline", {points: csv(points)}));
   if (state.edit === "corners") {
+    if (points.length > 1) svg.append(svgEl(points.length === 4 ? "polygon" : "polyline", {points: csv(points)}));
     for (const [x, y] of points) svg.append(svgEl("circle", {cx: x * 1000, cy: y * 1000, r: 7}));
+  } else {
+    if (points.length > 1) svg.append(svgEl(points.length === 4 ? "polygon" : "polyline", {points: csv(points)}));
+    drawReferenceSupport(svg);
   }
   if (state.region) {
     const [a, b, c, d] = state.region;
@@ -290,8 +324,13 @@ function drawOverlay() {
   }
   const message = state.edit === "region" ? "在画面拖动以选取范围，或连续点选两端。" :
     state.region ? `面板选区 ${state.region.map((x) => x.toFixed(3)).join(" / ")} · ${toolSpec()?.coordinate_space === "camera" ? "相机" : "面板"}归一化坐标` : "分析范围：整张面板";
+  const revision = selectedRevision();
+  const reference = revision?.info?.internal_reference;
+  const geometry = reference
+    ? ` · 标定 v${revision.revision} 使用内部参照 ${reference.points} 点，圈内为参照支撑区，其余沿用四角`
+    : "";
   $("region-readout").hidden = false;
-  $("region-readout").textContent = message;
+  $("region-readout").textContent = message + geometry;
 }
 
 function pointerPoint(event) {
@@ -347,6 +386,122 @@ $("image-wrap").addEventListener("pointercancel", () => { pointerStart = null; }
 
 function toolSpec() {
   return state.catalog.tools.find((spec) => spec.key === $("tool").value);
+}
+
+function optionFields() {
+  return [...$("options").querySelectorAll("[data-value-type]")];
+}
+
+function optionValue(field) {
+  if (field.dataset.valueType === "checkbox") return field.checked;
+  if (field.dataset.valueType === "json") {
+    try {
+      return JSON.parse(field.value);
+    } catch {
+      throw new Error("检查点数组不是有效 JSON。");
+    }
+  }
+  if (field.dataset.valueType === "number") {
+    if (!field.checkValidity()) {
+      field.reportValidity();
+      throw new Error("检查工具参数超出可用范围。");
+    }
+    return field.value === "" ? null : field.valueAsNumber;
+  }
+  return field.value;
+}
+
+function parsePairs(field) {
+  const pairs = optionValue(field);
+  if (!Array.isArray(pairs)) throw new Error("检查点数组应为 JSON 列表。");
+  return pairs;
+}
+
+function syncCorrectionTools() {
+  const enabled = $("tool").value === "fiducials" && Boolean(state.capture);
+  $("correction-actions").hidden = !enabled;
+  $("open-correction").disabled = !correctionSavable();
+}
+
+function correctionSavable() {
+  return Boolean(state.correction) && state.correction.savable !== false;
+}
+
+function openCorrectionEditor() {
+  if (!correctionSavable()) {
+    notice("请先预览参照修正，确认有可用且不会折叠的结果后再保存。", true);
+    return;
+  }
+  const revision = state.calibrations.find((entry) => entry.id === state.correction.calibration_id);
+  $("correction-base").value = revision ? `v${revision.revision}` : "整张相机图（无四角版本）";
+  $("correction-note").value = "";
+  $("correction-edit").hidden = false;
+  $("save-correction").disabled = false;
+  $("cancel-correction").disabled = false;
+  $("correction-edit").scrollIntoView({block: "nearest"});
+}
+
+function closeCorrectionEditor() {
+  $("correction-edit").hidden = true;
+  $("save-correction").disabled = true;
+  $("cancel-correction").disabled = true;
+}
+
+async function previewCorrection() {
+  if (!state.capture) throw new Error("请先选择采集图。");
+  const pairsField = optionFields().find((field) => field.name === "pairs");
+  if (!pairsField) throw new Error("当前工具没有检查点数组。");
+  const threshold = optionFields().find((field) => field.name === "threshold");
+  const reach = optionFields().find((field) => field.name === "reach");
+  const body = {
+    calibration_id: $("revision").value || "identity",
+    pairs: parsePairs(pairsField),
+    threshold: threshold ? optionValue(threshold) : 6,
+    reach: reach ? optionValue(reach) : .30,
+  };
+  $("preview-correction").disabled = true;
+  notice("正在生成参照修正预览，不会修改现有版本…");
+  try {
+    const reply = await post(`/api/captures/${state.capture.id}/geometry-correction`, body);
+    const sampling = reply.metrics?.reference_min_sampling;
+    state.correction = {...body, ready: true, savable: !(sampling !== null && sampling !== undefined && sampling <= 1e-4)};
+    showReport($("report"), reply);
+    syncCorrectionTools();
+    notice(state.correction.savable
+      ? "预览完成。核对左侧四角与右侧参照修正，确认后才保存为独立版本。"
+      : "预览显示该修正可能折叠，不能保存；请缩小影响范围或复核参照点。");
+  } finally {
+    $("preview-correction").disabled = false;
+  }
+}
+
+async function saveCorrection() {
+  const correction = state.correction;
+  if (!correction?.ready) throw new Error("请先生成并核对参照修正预览。");
+  const capture = state.capture;
+  $("save-correction").disabled = true;
+  notice("正在保存独立标定版本…");
+  try {
+    const revision = await post(`/api/captures/${capture.id}/geometry-correction`, {
+      calibration_id: correction.calibration_id,
+      pairs: correction.pairs,
+      threshold: correction.threshold,
+      reach: correction.reach,
+      note: $("correction-note").value,
+      save: true,
+    });
+    if (state.capture?.id !== capture.id) return;
+    closeCorrectionEditor();
+    state.correction = null;
+    await refreshCaptures();
+    const payload = await json(`/api/captures/${capture.id}/calibrations`);
+    setCalibrationList(payload.calibrations, revision.id);
+    invalidateDraft();
+    syncCorrectionTools();
+    notice(`已保存独立标定 v${revision.revision}：四角+内部参照，可在“查看标定”中切换对比。`);
+  } finally {
+    if (!$("correction-edit").hidden) $("save-correction").disabled = false;
+  }
 }
 
 function fillComparison() {
@@ -405,38 +560,24 @@ async function displayTool() {
   drawOverlay();
   fillComparison();
   invalidateDraft();
+  syncCorrectionTools();
   await updateCompareCalibrations();
 }
 
 function invalidateDraft() {
   state.draftResult = null;
   state.requestSerial++;
+  state.correction = null;
+  closeCorrectionEditor();
   $("save-report").disabled = true;
+  syncCorrectionTools();
 }
 
 function currentRequest() {
   if (!state.capture) throw new Error("请先选择采集图。");
   const tool = toolSpec();
   const options = {};
-  for (const field of $("options").querySelectorAll("[data-value-type]")) {
-    const type = field.dataset.valueType;
-    if (type === "checkbox") options[field.name] = field.checked;
-    else if (type === "json") {
-      try {
-        options[field.name] = JSON.parse(field.value);
-      } catch {
-        throw new Error("检查点数组不是有效 JSON。");
-      }
-    } else if (type === "number") {
-      if (!field.checkValidity()) {
-        field.reportValidity();
-        throw new Error("检查工具参数超出可用范围。");
-      }
-      options[field.name] = field.value === "" ? null : field.valueAsNumber;
-    } else {
-      options[field.name] = field.value;
-    }
-  }
+  for (const field of optionFields()) options[field.name] = optionValue(field);
   const output = {
     tool: tool.key,
     region: state.region,
@@ -489,6 +630,17 @@ const labels = {
   dry_patches: "样本格数", source_error_x_px: "横向误差 px", source_error_y_px: "纵向误差 px",
   panel_mm: "面板毫米长度", panel_px: "面板物理像素长度", source_px: "原相机像素长度",
   dark_capture_id: "暗场标识", flat_capture_id: "平场标识", fit_rmse: "拟合均方根误差",
+  geometry_model: "几何模型", base_calibration: "对照四角版本", base_calibration_id: "对照四角版本",
+  reference_count: "纳入参照点数", reference_excluded_count: "排除参照点数",
+  reference_correction_area_pct: "参照修正覆盖 %", corner_only_area_pct: "仅四角覆盖 %",
+  reference_min_sampling: "最小局部采样", max_correction_pct: "最大修正幅度 %",
+  changed_region_p98: "改动区第 98 百分位", geometry_reference_support_pct: "参照支撑覆盖 %",
+  reference_points: "参照点数", reference_included: "参与修正", reference_reason: "排除原因",
+  leave_one_out_px: "与周边一致性 px", local_correction_px: "本地修正 px",
+  corrected_distance_px: "修正后偏差 px", base_reference_distance_px: "四角偏差 px",
+  max_point_deviation_px: "最大偏差 px", rms_camera_deviation_px: "四角均方根偏差 px",
+  rms_corrected_deviation_px: "修正后均方根偏差 px", points_outside_reminder: "超出提醒值点数",
+  point_count: "检查点数",
 };
 
 function valueText(value) {
@@ -696,12 +848,26 @@ on("panel-search", "input", refreshPanels);
 on("capture-filter", "input", displayCaptureList);
 on("record-filter", "input", refreshRecords);
 on("tool", "change", displayTool);
-on("options", "input", invalidateDraft);
+on("options", "input", () => {
+  if (state.correction) {
+    state.correction = null;
+    $("open-correction").disabled = true;
+    closeCorrectionEditor();
+  }
+  invalidateDraft();
+});
 on("comparison", "change", async () => { invalidateDraft(); await updateCompareCalibrations(); });
 on("compare-revision", "change", invalidateDraft);
-on("revision", "change", () => { invalidateDraft(); drawOverlay(); });
+on("revision", "change", () => { invalidateDraft(); drawOverlay(); syncCorrectionTools(); });
 on("preview", "click", () => runReport(false));
 on("save-report", "click", () => runReport(true));
+on("preview-correction", "click", () => previewCorrection());
+on("open-correction", "click", () => openCorrectionEditor());
+on("save-correction", "click", () => saveCorrection());
+on("cancel-correction", "click", () => {
+  closeCorrectionEditor();
+  notice("已返回四角结果；当前查看版本未改动。");
+});
 on("new-panel", "click", () => $("panel-dialog").showModal());
 on("new-capture", "click", () => $("capture-dialog").showModal());
 document.querySelectorAll("[data-close]").forEach((button) => {

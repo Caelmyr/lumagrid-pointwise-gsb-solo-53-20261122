@@ -14,7 +14,8 @@ from .geometry import (
 )
 from .model import Problem, Region, ToolRequest, choice, mapping, plain
 from .raster import (
-    DecodedRaster, code_statistics, decode, luma, masked_rgb, png_bytes, resize_report, rounding,
+    DecodedRaster, code_statistics, decode, heatmap, luma, masked_rgb, png_bytes, resize_report,
+    rounding,
 )
 from .storage import Store
 
@@ -30,12 +31,23 @@ class Scene:
     @classmethod
     def load(cls, store: Store, capture_id: str, calibration_id: str | None = None) -> "Scene":
         panel, capture, raw, revision = store.read_for_analysis(capture_id, calibration_id)
-        calibration = Calibration.from_raw(revision["corners"]) if revision else Calibration.identity()
+        calibration = Calibration.from_revision(revision) if revision else Calibration.identity()
         return cls(panel, capture, revision, calibration, decode(raw))
 
     @property
     def revision_id(self) -> str:
         return self.revision["id"] if self.revision else "identity"
+
+    @property
+    def base_revision(self) -> str | None:
+        """The four-corner version an internal-reference correction builds on."""
+        if not self.revision:
+            return None
+        return (self.revision.get("info") or {}).get("base_calibration_id") or self.revision["id"]
+
+    @property
+    def uses_internal_reference(self) -> bool:
+        return self.calibration.field is not None
 
     @property
     def scale(self) -> tuple[int, int]:
@@ -51,6 +63,9 @@ class Scene:
             "source_bits": self.image.bits,
             "calibration_id": self.revision_id,
             "calibration_revision": self.revision["revision"] if self.revision else None,
+            "base_calibration_id": self.base_revision,
+            "geometry_model": "corners+internal-reference" if self.uses_internal_reference else "corners",
+            "internal_reference": self.calibration.reference_summary() or None,
             "exposure": self.capture["exposure"],
         }
 
@@ -215,10 +230,21 @@ def rectification(scene: Scene, comparison: Scene | None, region: Region, option
         **plane.info(),
         "sampling": method,
         "geometry": scene.calibration.overview(scene.image.valid.shape),
+        "geometry_model": "corners+internal-reference" if scene.uses_internal_reference else "corners",
         "recorded_code": code_statistics(plane.gray[plane.observed]),
     }
     report = Report("面板展平", "在标定后的面板坐标中查看可采样区域。", stats)
     report.image("rectified.png", masked_rgb(plane.rgb, plane.observed))
+    if scene.uses_internal_reference:
+        support = scene.calibration.support(plane.points)
+        summary = scene.calibration.reference_summary()
+        stats["geometry_reference_support_pct"] = summary["support_area_pct"]
+        report.image("geometry-support.png", heatmap(support, plane.observed, 0, 1))
+        report.metrics["geometry_support_scale"] = "青色区使用内部参照；暗色区仍沿用四角投影"
+        report.warnings.append(
+            f"本版标定在约 {summary['support_area_pct']:.0f}% 面板面积使用内部参照，"
+            "其余区域仍按四角投影展平；对照图为参照支撑强度，不是图像内容。"
+        )
     if plane.coverage < .97:
         report.warnings.append("深灰区域在原始采集中缺少完整像素采样支撑。")
     if scene.revision is None:
@@ -301,7 +327,8 @@ def execute(store: Store, capture_id: str, data: dict) -> tuple[Scene, Scene | N
     if second and second.capture["id"] == scene.capture["id"]:
         raise Problem("请选择另一张采集作为对照。")
     run: Callable = config["run"]
-    report = run(scene, second, request.region, request.options)
+    outcome = run(scene, second, request.region, request.options)
+    report, correction = outcome if isinstance(outcome, tuple) else (outcome, None)
     domain = config.get("coordinate_space", "panel")
     report.warnings.extend(scene_quality_notes(scene, second, domain))
     input_state = {
@@ -317,6 +344,13 @@ def execute(store: Store, capture_id: str, data: dict) -> tuple[Scene, Scene | N
         "comparison": second.describe() if second else None,
         "synthetic": scene.panel["synthetic"],
     }
+    if correction is not None:
+        input_state["correction"] = correction
     report.metrics["source_title"] = scene.capture["title"]
     report.metrics["synthetic"] = scene.panel["synthetic"]
+    if scene.uses_internal_reference:
+        report.metrics["geometry_model"] = "corners+internal-reference"
+        report.metrics["geometry_reference_support_pct"] = scene.calibration.reference_summary()[
+            "support_area_pct"
+        ]
     return scene, second, input_state, report

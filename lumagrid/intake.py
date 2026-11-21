@@ -7,7 +7,7 @@ from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 import json
 import re
 
-from .geometry import Calibration
+from .geometry import Calibration, ResidualField
 from .handoff import checked_path, evidence_filename, json_payload
 from .model import CaptureSpec, Problem, mapping, plain, sequence, source_name
 from .raster import MAX_SOURCE_BYTES, Asset, decode_asset
@@ -113,10 +113,12 @@ def prepare_preview(raw: bytes) -> tuple[dict, list[IntakeItem]]:
                 if record.get("calibration") is not None:
                     article = mapping(record["calibration"], "采集成员校准")
                     cal = Calibration.from_raw(article.get("corners"))
+                    internal = ResidualField.from_info(article.get("internal_reference"))
                     calibration = {
                         "corners": cal.corners.tolist(),
-                        "overview": cal.overview((asset.height, asset.width)),
+                        "overview": cal.corrected(internal).overview((asset.height, asset.width)),
                         "note": plain(article.get("note"), "角点说明", 400),
+                        "internal_reference": internal.describe() if internal else None,
                     }
                 key = plain(record.get("id"), "来源采集标识", 64)
                 items.append(IntakeItem(spec, asset, calibration, file_key, key or None, checksum))
@@ -141,7 +143,12 @@ def save_prepared(store: Store, panel_id: str, manifest: dict, items: list[Intak
             if member.calibration:
                 cal = member.calibration
                 mark = cal["note"] or "继承采集包中的实际校准"
-                store.insert_calibration(conn, capture_id, cal["corners"], cal["overview"], mark)
+                info = cal["overview"]
+                if cal.get("internal_reference"):
+                    # Imported corrections become their own version; the packet
+                    # does not carry a local base id to point at.
+                    info = {**info, "internal_reference": cal["internal_reference"]}
+                store.insert_calibration(conn, capture_id, cal["corners"], info, mark)
         return [store.capture_view(conn, store.require_capture(conn, uid)) for uid in ids]
 
 
@@ -231,7 +238,14 @@ def package_captures(store: Store, panel_id: str, selected: list[str]):
             "path": path,
             "sha256": capture["original"],
             "attributes": attributes,
-            "calibration": {"corners": cal["corners"], "note": cal["note"]} if cal else None,
+            "calibration": (
+                {
+                    "corners": cal["corners"],
+                    "note": cal["note"],
+                    "internal_reference": cal["info"].get("internal_reference"),
+                }
+                if cal else None
+            ),
         }
         metadata.append(member)
         archive_content.append((path, payload))
