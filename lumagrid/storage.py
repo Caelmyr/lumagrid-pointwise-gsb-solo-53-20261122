@@ -523,17 +523,28 @@ class Store:
                 if row["panel_id"] != panel_id or row["state"] != "verified":
                     raise Problem("交接包只支持当前面板已复核的记录。")
                 inspection = self.inspection_view(conn, row)
+                selections = [
+                    (row["capture_id"], inspection["request"].get("calibration_id")
+                     or inspection["request"].get("source", {}).get("calibration_id")),
+                    (row["compare_id"], inspection["request"].get("comparison_calibration_id")),
+                ]
+                for member in inspection["request"].get("recheck_captures") or []:
+                    if isinstance(member, dict):
+                        selections.append((member.get("capture_id"), member.get("calibration_id")))
                 captures = []
+                included = set()
                 seen = set()
-                for key, calibration_key in (("capture_id", "calibration_id"), ("compare_id", "comparison_calibration_id")):
-                    if not row[key]:
+                for capture_key, calibration_id in selections:
+                    if not capture_key or (capture_key, calibration_id) in seen:
                         continue
-                    capture = self.capture_view(conn, self.require_capture(conn, row[key]))
+                    seen.add((capture_key, calibration_id))
+                    capture = self.capture_view(conn, self.require_capture(conn, capture_key))
                     checksum = capture["original"]
-                    calibration_id = inspection["request"].get(calibration_key) or "identity"
-                    calibration = self.calibration(conn, row[key], calibration_id)
-                    actual = self.read_blob(conn, checksum)[0] if include_sources and checksum not in seen else None
-                    seen.add(checksum)
+                    calibration = self.calibration(conn, capture_key, calibration_id or "identity")
+                    actual = None
+                    if include_sources and checksum not in included:
+                        actual = self.read_blob(conn, checksum)[0]
+                        included.add(checksum)
                     captures.append((capture, calibration, actual))
                 files = {item["name"]: self.read_blob(conn, item["checksum"])[0] for item in inspection["files"]}
                 result.append({

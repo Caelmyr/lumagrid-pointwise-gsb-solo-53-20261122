@@ -19,6 +19,7 @@ from .model import (
     plain, required_text, sequence,
 )
 from .raster import MAX_SOURCE_BYTES, decode_asset
+from .recheck import run_recheck
 from .storage import STATES, Store
 from .timing import timing_report
 
@@ -244,6 +245,18 @@ def create_app(data_root: Path | None = None):
         saved = store.add_inspection(
             primary.capture, secondary.capture if secondary else None,
             snapshot["tool"], title, snapshot, report.as_json(), report.files,
+        )
+        return {"record": saved, "result": report_preview(report, snapshot)}, 201
+
+    @app.post("/api/panels/<panel_id>/recheck")
+    def recheck(panel_id):
+        data = args_json()
+        entries, report, snapshot = run_recheck(store, panel_id, data)
+        if not boolean(data.get("save"), "保存检查", default=False):
+            return report_preview(report, snapshot)
+        title = plain(data.get("title"), "检查名称", 110, default=report.title)
+        saved = store.add_inspection(
+            entries[0].capture, None, "recheck", title, snapshot, report.as_json(), report.files,
         )
         return {"record": saved, "result": report_preview(report, snapshot)}, 201
 

@@ -44,6 +44,7 @@
         <nav class="tabs" aria-label="工作区">
           <button class="active" data-tab="capture">检查工作台</button>
           <button data-tab="records">复核与交接</button>
+          <button data-tab="recheck">复拍亮点归并</button>
           <button data-tab="timing">时钟配对</button>
           <button data-tab="backdrop">镜头校正</button>
           <button data-tab="intake">采集包</button>
@@ -100,6 +101,19 @@
             <form id="verify-form" class="inline-actions" enctype="multipart/form-data"><label>选择 ZIP 文件<input name="archive" type="file" accept=".zip" required></label><button class="button quiet">检查内容哈希</button></form>
             <p id="verify-result" class="muted"></p>
           </section>
+        </section>
+        <section class="tab-panel" id="tab-recheck" hidden>
+          <form id="recheck-form" class="session-form">
+            <h2>复拍亮点归并</h2>
+            <p class="muted">为同一个面板挑选 2 至 4 张已经标好四角的照片，在每张原图上点出可疑亮点，再按面板实际位置归并。每张图可单独填写点位误差范围；同一张清晰图上分开点的两个亮点不会被合并，另一张图的单个点位若同时对上两处，会留待复核。边缘点位会区分“画面内但没有点位”和“这张图没拍到该位置”。</p>
+            <div class="recheck-captures" id="recheck-captures"></div>
+            <div class="recheck-legend"><span><i style="background:#4aca8f"></i>有点位</span><span><i style="background:#f7bd46"></i>待复核重叠</span><span><i style="background:#ef8f45"></i>画面内无点位</span><span><i style="background:#96a4ab"></i>未拍到该位置</span></div>
+            <div class="form-grid">
+              <label>检查名称<input name="title" maxlength="110" placeholder="多图亮点位置归并"></label>
+            </div>
+            <div class="inline-actions"><button class="button primary" id="recheck-preview" type="button">运行归并</button><button class="button quiet" id="recheck-save" type="button" disabled>保存复现检查</button></div>
+          </form>
+          <section id="recheck-report" class="report" hidden></section>
         </section>
         <section class="tab-panel" id="tab-timing" hidden>
           <form id="timing-form" class="session-form">

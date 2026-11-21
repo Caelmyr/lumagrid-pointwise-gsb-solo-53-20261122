@@ -5,6 +5,7 @@ const state = {
   calibrations: [], compareCalibrations: [], region: null,
   edit: null, cornerDraft: [], startProbe: null,
   draftResult: null, activeTab: "capture",
+  recheck: {slots: [], result: null, request: null},
   records: [], record: null, checkedRecords: new Set(),
   requestSerial: 0, recordSerial: 0, currentSearch: 0,
 };
@@ -172,6 +173,7 @@ async function selectCapture(capture) {
   state.cornerDraft = [];
   state.startProbe = null;
   state.draftResult = null;
+  recheckReset();
   $("report").hidden = true;
   $("save-report").disabled = true;
   $("revision").replaceChildren();
@@ -489,6 +491,17 @@ const labels = {
   dry_patches: "样本格数", source_error_x_px: "横向误差 px", source_error_y_px: "纵向误差 px",
   panel_mm: "面板毫米长度", panel_px: "面板物理像素长度", source_px: "原相机像素长度",
   dark_capture_id: "暗场标识", flat_capture_id: "平场标识", fit_rmse: "拟合均方根误差",
+  captures: "照片数", clicks: "点位总数", consolidated_spots: "归并位置数",
+  multi_capture_spots: "多图互证位置", single_capture_spots: "仅单图有点位",
+  unconfirmed_spots: "待复核位置", ambiguous_clicks: "待复核重叠点位",
+  review_observations: "待复核观察次数", no_evidence_observations: "画面内无点位次数",
+  not_captured_observations: "未拍到次数", tolerances_panel_px: "各图误差范围（面板像素）",
+  edge_clicks: "边缘点位", spot: "位置", panel_x: "面板 x", panel_y: "面板 y",
+  confirmed_captures: "互证照片数",
+  status: "状态", point: "点位", camera_x: "相机 x", camera_y: "相机 y",
+  camera_px_x: "相机像素 x", camera_px_y: "相机像素 y", tolerance_panel_px: "误差范围（面板像素）",
+  assigned_spot: "归并位置", candidate_spots: "候选位置", state: "判定", on_panel_edge: "面板边缘",
+  capture: "照片",
 };
 
 function valueText(value) {
@@ -637,6 +650,10 @@ async function selectRecord(id) {
   const compareRev = record.request?.comparison?.calibration_revision;
   const source = record.request?.source?.capture_title;
   const matters = [current, source, rev ? `主图标定 v${rev}` : "主图整图坐标", compareRev ? `对照标定 v${compareRev}` : ""];
+  if (record.tool === "recheck") {
+    const photos = record.request?.recheck_captures?.length || 0;
+    matters.splice(1, matters.length - 1, `${photos} 张照片点位归并`);
+  }
   summary.append(node("h2", record.title), node("p", matters.filter(Boolean).join(" · "), {class: "muted"}));
   detail.append(summary);
   if (decisions.length) {
@@ -672,6 +689,79 @@ async function selectRecord(id) {
   const result = node("article", null, {class: "report"});
   detail.append(result);
   showReport(result, {...record.report, files: record.files}, record.id);
+  if (record.tool === "recheck") detail.append(recheckRecalldetail(record));
+}
+
+function recheckRecalldetail(record) {
+  const section = node("section", null, {class: "subpanel"});
+  section.append(node("h2", "当时的原始点位与四角标定"));
+  section.append(node("p", "以下为保存复核时的各图点位（相机归一化坐标）、误差范围与所用四角版本，可据此回看复现。", {class: "muted"}));
+  const spots = record.request?.spots || [];
+  if (spots.length) {
+    const wrap = node("div", null, {class: "data-table"});
+    const table = node("table");
+    const head = node("thead");
+    const tr = node("tr");
+    const columns = ["位置", "面板 x", "面板 y", "状态", "各图判断"];
+    tr.append(...columns.map((label) => node("th", label, {scope: "col"})));
+    head.append(tr);
+    const body = node("tbody");
+    for (const spot of spots) {
+      const line = node("tr");
+      const states = Object.entries(spot.states || {}).map(([key, value]) => {
+        const text = {matched: "有点位", review_overlap: "待复核重叠", no_evidence: "画面内无点位", not_captured: "未拍到该位置"}[value] || value;
+        return `${key.toUpperCase()} ${text}`;
+      }).join("；");
+      line.append(
+        node("td", `S${spot.spot}`), node("td", valueText(spot.panel?.[0])), node("td", valueText(spot.panel?.[1])),
+        node("td", spot.status), node("td", states),
+      );
+      body.append(line);
+    }
+    table.append(head, body);
+    wrap.append(table);
+    section.append(wrap);
+  }
+  const photos = record.request?.recheck_captures || [];
+  for (const photo of photos) {
+    const details = node("details", null, {class: "report-details"});
+    details.append(node("summary", `${photo.capture_title} · 标定 v${photo.calibration_revision} · 误差 ±${photo.tolerance_panel_px} 面板像素`));
+    const corners = node("p", null, {class: "muted"});
+    corners.textContent = "四角： " + (photo.calibration_corners || []).map(
+      (point) => `(${valueText(point[0])}, ${valueText(point[1])})`,
+    ).join("  ");
+    details.append(corners);
+    if (photo.points?.length) {
+      const wrap = node("div", null, {class: "data-table"});
+      const table = node("table");
+      const head = node("thead");
+      const tr = node("tr");
+      const columns = ["点位", "相机 x", "相机 y", "相机像素 x", "相机像素 y", "面板 x", "面板 y", "归并位置", "候选", "边缘"];
+      tr.append(...columns.map((label) => node("th", label, {scope: "col"})));
+      head.append(tr);
+      const body = node("tbody");
+      for (const point of photo.points) {
+        const line = node("tr");
+        line.append(
+          node("td", point.label),
+          node("td", valueText(point.camera_normalized?.[0])), node("td", valueText(point.camera_normalized?.[1])),
+          node("td", valueText(point.camera_px?.[0])), node("td", valueText(point.camera_px?.[1])),
+          node("td", valueText(point.panel?.[0])), node("td", valueText(point.panel?.[1])),
+          node("td", point.ambiguous ? "待复核" : (point.assigned_spot ? `S${point.assigned_spot}` : "—")),
+          node("td", (point.candidate_spots || []).map((value) => `S${value}`).join(" / ") || "—"),
+          node("td", point.on_panel_edge ? "是" : "否"),
+        );
+        body.append(line);
+      }
+      table.append(head, body);
+      wrap.append(table);
+      details.append(wrap);
+    } else {
+      details.append(node("p", "该图没有点位。", {class: "muted"}));
+    }
+    section.append(details);
+  }
+  return section;
 }
 
 async function installDemo() {
@@ -702,6 +792,8 @@ on("compare-revision", "change", invalidateDraft);
 on("revision", "change", () => { invalidateDraft(); drawOverlay(); });
 on("preview", "click", () => runReport(false));
 on("save-report", "click", () => runReport(true));
+on("recheck-preview", "click", () => runRecheck(false));
+on("recheck-save", "click", () => runRecheck(true));
 on("new-panel", "click", () => $("panel-dialog").showModal());
 on("new-capture", "click", () => $("capture-dialog").showModal());
 document.querySelectorAll("[data-close]").forEach((button) => {
@@ -816,10 +908,238 @@ document.querySelectorAll("[data-tab]").forEach((tab) => {
       try { await refreshRecords(); }
       catch (error) { notice(error.message, true); }
     } else if (state.activeTab === "backdrop") fillCorrectionFields();
+    else if (state.activeTab === "recheck") fillRecheck();
     else if (state.activeTab === "intake") packetMembers();
   });
 });
 
+
+function recheckReset() {
+  state.recheck.slots = [];
+  state.recheck.result = null;
+  state.recheck.request = null;
+  $("recheck-captures").replaceChildren();
+  $("recheck-report").hidden = true;
+  $("recheck-save").disabled = true;
+}
+
+function fillRecheck() {
+  const root = $("recheck-captures");
+  const eligible = state.captures.filter((capture) => capture.calibration);
+  if (!eligible.length) {
+    root.replaceChildren(node("p", "当前面板还没有已标定四角的采集。请先在检查工作台为照片保存标定。", {class: "muted"}));
+    $("recheck-preview").disabled = true;
+    return;
+  }
+  $("recheck-preview").disabled = false;
+  const chosen = state.recheck.slots.map((slot) => slot.captureId).filter(Boolean);
+  const wanted = state.recheck.slots.length >= 2 ? state.recheck.slots.length : 2;
+  while (state.recheck.slots.length < wanted) {
+    state.recheck.slots.push({captureId: "", calibrationId: "", points: [], tolerance: 6});
+  }
+  root.replaceChildren(...state.recheck.slots.map((slot, index) => recheckCard(slot, index, eligible, chosen)));
+  if (state.recheck.slots.length < 4) {
+    const add = node("button", "增加一张照片", {type: "button", class: "button compact quiet"});
+    add.addEventListener("click", () => {
+      state.recheck.slots.push({captureId: "", calibrationId: "", points: [], tolerance: 6});
+      fillRecheck();
+    });
+    root.append(add);
+  }
+}
+
+function recheckCard(slot, index, eligible, chosen) {
+  const card = node("article", null, {class: "recheck-card"});
+  const head = node("header");
+  head.append(node("h3", `照片 ${index + 1}`));
+  if (state.recheck.slots.length > 2) {
+    const remove = node("button", "移除", {type: "button", class: "button compact quiet"});
+    remove.addEventListener("click", () => {
+      state.recheck.slots.splice(index, 1);
+      recheckInvalidate();
+      fillRecheck();
+    });
+    head.append(remove);
+  }
+  card.append(head);
+  const grid = node("div", null, {class: "recheck-grid"});
+  const choose = node("label", "照片");
+  const select = node("select");
+  setOptions(select, eligible
+    .filter((capture) => capture.id === slot.captureId || !chosen.includes(capture.id))
+    .map((capture) => [capture.id, `${capture.title} · v${capture.calibration.revision}`]), undefined, "选择已标定照片");
+  select.value = slot.captureId;
+  select.addEventListener("change", async () => {
+    slot.captureId = select.value;
+    slot.points = [];
+    slot.calibrationId = "";
+    recheckInvalidate();
+    if (slot.captureId) {
+      const capture = state.captures.find((item) => item.id === slot.captureId);
+      const {calibrations} = await json(`/api/captures/${slot.captureId}/calibrations`);
+      if (slot.captureId !== select.value) return;
+      slot.calibrations = calibrations;
+      slot.calibrationId = calibrations.find((entry) => entry.id === capture?.calibration?.id)?.id || calibrations[0]?.id || "";
+    }
+    fillRecheck();
+  });
+  choose.append(select);
+  grid.append(choose);
+  if (slot.captureId) {
+    const version = node("label", "四角标定版本");
+    const versionSelect = node("select");
+    setOptions(versionSelect, (slot.calibrations || []).map((entry) => [entry.id, `v${entry.revision} · 覆盖 ${entry.info.coverage_pct}%`]), slot.calibrationId);
+    versionSelect.value = slot.calibrationId;
+    versionSelect.addEventListener("change", () => {
+      slot.calibrationId = versionSelect.value;
+      recheckInvalidate();
+    });
+    version.append(versionSelect);
+    grid.append(version);
+    const tolerance = node("label", "本图点位误差范围（面板像素）");
+    const input = node("input", null, {type: "number", min: "0.5", max: "200", step: "0.5", value: String(slot.tolerance)});
+    input.addEventListener("input", () => {
+      const value = Number(input.value);
+      if (Number.isFinite(value) && value >= 0.5) slot.tolerance = value;
+      recheckInvalidate();
+    });
+    tolerance.append(input);
+    grid.append(tolerance);
+  }
+  card.append(grid);
+  const stage = node("div", null, {class: "recheck-stage"});
+  if (!slot.captureId) {
+    card.append(node("p", "先从上方选择一张已标定照片。", {class: "muted"}));
+    return card;
+  }
+  if (!slot.calibrationId) {
+    card.append(node("p", "这张照片缺少可用的四角标定版本。", {class: "muted"}));
+    return card;
+  }
+  const image = node("img", null, {alt: `照片 ${index + 1}`, src: `/api/captures/${slot.captureId}/image/preview`});
+  image.addEventListener("load", () => drawRecheckStage(slot, stage, image));
+  image.addEventListener("error", () => notice("读取照片预览失败。", true));
+  stage.append(image);
+  if (image.complete && image.naturalWidth) drawRecheckStage(slot, stage, image);
+  stage.classList.add("staging");
+  stage.addEventListener("pointerup", (event) => {
+    if (event.button !== 0) return;
+    const bounds = image.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) return;
+    const x = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+    const y = Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height));
+    slot.points.push([Number(x.toFixed(6)), Number(y.toFixed(6))]);
+    recheckInvalidate();
+    drawRecheckStage(slot, stage, image);
+    renderRecheckPoints(slot, list);
+  });
+  card.append(stage);
+  const list = node("div", null, {class: "recheck-points"});
+  card.append(list);
+  const toolbar = node("div", null, {class: "recheck-toolbar"});
+  const undo = node("button", "撤回最后一点", {type: "button", class: "button compact quiet"});
+  undo.addEventListener("click", () => {
+    slot.points.pop();
+    recheckInvalidate();
+    drawRecheckStage(slot, stage, image);
+    renderRecheckPoints(slot, list);
+  });
+  const clear = node("button", "清空本图点位", {type: "button", class: "button compact quiet"});
+  clear.addEventListener("click", () => {
+    slot.points = [];
+    recheckInvalidate();
+    drawRecheckStage(slot, stage, image);
+    renderRecheckPoints(slot, list);
+  });
+  toolbar.append(undo, clear);
+  card.append(toolbar);
+  renderRecheckPoints(slot, list);
+  return card;
+}
+
+function drawRecheckStage(slot, stage, image) {
+  stage.querySelectorAll("svg").forEach((element) => element.remove());
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 1000 1000");
+  svg.setAttribute("preserveAspectRatio", "none");
+  slot.points.forEach(([x, y], order) => {
+    const cx = x * 1000;
+    const cy = y * 1000;
+    svg.append(svgEl("circle", {cx, cy, r: 9, stroke: "#c9ffea"}));
+    svg.append(svgEl("line", {x1: cx - 14, y1: cy, x2: cx + 14, y2: cy, stroke: "#c9ffea"}));
+    svg.append(svgEl("line", {x1: cx, y1: cy - 14, x2: cx, y2: cy + 14, stroke: "#c9ffea"}));
+    const text = svgEl("text", {x: cx + 13, y: cy - 11});
+    text.textContent = `P${order + 1}`;
+    svg.append(text);
+  });
+  stage.append(svg);
+}
+
+function renderRecheckPoints(slot, list) {
+  list.replaceChildren();
+  if (!slot.points.length) {
+    list.append(node("span", "尚未点选。点击照片添加可疑亮点。", {class: "recheck-empty"}));
+    return;
+  }
+  slot.points.forEach(([x, y], order) => {
+    list.append(node("span", `P${order + 1} · ${(x * 100).toFixed(2)}% , ${(y * 100).toFixed(2)}%`));
+  });
+}
+
+function recheckInvalidate() {
+  state.recheck.result = null;
+  state.recheck.request = null;
+  $("recheck-save").disabled = true;
+}
+
+function recheckRequest() {
+  const captures = state.recheck.slots
+    .filter((slot) => slot.captureId)
+    .map((slot) => ({
+      capture_id: slot.captureId,
+      calibration_id: slot.calibrationId || "identity",
+      tolerance_px: slot.tolerance,
+      points: slot.points,
+    }));
+  if (captures.length < 2) throw new Error("请至少选择两张已标定照片。");
+  if (new Set(captures.map((item) => item.capture_id)).size !== captures.length) {
+    throw new Error("同一张照片不能重复选择。");
+  }
+  if (!captures.some((item) => item.points.length)) throw new Error("请至少在照片上点出一个可疑亮点。");
+  return {
+    captures,
+    title: $("recheck-form").elements.title.value || undefined,
+  };
+}
+
+async function runRecheck(save) {
+  const panelId = state.panel.id;
+  const body = (save && state.recheck.request) ? state.recheck.request : recheckRequest();
+  const button = save ? $("recheck-save") : $("recheck-preview");
+  button.disabled = true;
+  notice(save ? "正在保存亮点归并…" : "正在归并跨图点位…");
+  try {
+    const reply = await post(`/api/panels/${panelId}/recheck`, {...body, save});
+    if (state.panel?.id !== panelId) return;
+    showReport($("recheck-report"), reply.result || reply, reply.record?.id);
+    if (!save) {
+      state.recheck.request = body;
+      state.recheck.result = reply.result || reply;
+      $("recheck-save").disabled = false;
+      notice("");
+    } else {
+      state.recheck.result = null;
+      state.recheck.request = null;
+      $("recheck-save").disabled = true;
+      await refreshPanels();
+      displayPanel();
+      notice("亮点归并检查已保存，可以在复核与交接中打开。");
+    }
+  } finally {
+    $("recheck-preview").disabled = false;
+    if (!save) $("recheck-save").disabled = !state.recheck.request;
+  }
+}
 
 function packetMembers() {
   const root = $("packet-members");
