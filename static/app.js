@@ -2,7 +2,7 @@ const $ = (id) => document.getElementById(id);
 const state = {
   catalog: {roles: {}, tools: [], review_states: {}},
   panels: [], panel: null, captures: [], capture: null,
-  calibrations: [], compareCalibrations: [], region: null,
+  calibrations: [], compareCalibrations: [], region: null, zones: [],
   edit: null, cornerDraft: [], startProbe: null,
   draftResult: null, activeTab: "capture",
   records: [], record: null, checkedRecords: new Set(),
@@ -168,6 +168,7 @@ async function selectCapture(capture) {
   state.capture = capture;
   state.calibrations = [];
   state.region = null;
+  state.zones = [];
   state.edit = null;
   state.cornerDraft = [];
   state.startProbe = null;
@@ -177,6 +178,7 @@ async function selectCapture(capture) {
   $("revision").replaceChildren();
   displayCapture();
   displayCaptureList();
+  displayZones();
   fillComparison();
   localStorage.setItem("lumagrid.capture", capture.id);
   const payload = await json(`/api/captures/${capture.id}/calibrations`);
@@ -288,7 +290,21 @@ function drawOverlay() {
     const rect = svgEl("polygon", {points: csv(selection), "stroke-dasharray": "6 4"});
     svg.append(rect);
   }
-  const message = state.edit === "region" ? "在画面拖动以选取范围，或连续点选两端。" :
+  const multi = Boolean(toolSpec()?.multi_region);
+  if (multi) {
+    const transform = homography(UNIT, cornerPoints());
+    state.zones.forEach((zone, index) => {
+      const [a, b, c, d] = zone.region;
+      const selection = [[a, b], [c, b], [c, d], [a, d]].map((point) => remap(transform, point));
+      svg.append(svgEl("polygon", {points: csv(selection), "stroke-dasharray": "6 4"}));
+      const label = svgEl("text", {x: selection[0][0] * 1000 + 10, y: selection[0][1] * 1000 + 34});
+      label.textContent = `Z${index + 1}${zone.axis === "horizontal" ? "·横" : "·纵"}`;
+      svg.append(label);
+    });
+  }
+  const message = state.edit === "region" ?
+    (multi ? "在画面拖动以框选一块斜边区域，可连续添加多块。" : "在画面拖动以选取范围，或连续点选两端。") :
+    multi ? (state.zones.length ? `已框 ${state.zones.length} 块斜边选区，可继续拖动添加；边方向在右侧列表调整。` : "尚未框选斜边选区。") :
     state.region ? `面板选区 ${state.region.map((x) => x.toFixed(3)).join(" / ")} · ${toolSpec()?.coordinate_space === "camera" ? "相机" : "面板"}归一化坐标` : "分析范围：整张面板";
   $("region-readout").hidden = false;
   $("region-readout").textContent = message;
@@ -307,15 +323,26 @@ function setRegion(first, last) {
   const [a, b] = remap(inverse, first).map((x) => Math.max(0, Math.min(1, x)));
   const [c, d] = remap(inverse, last).map((x) => Math.max(0, Math.min(1, x)));
   const output = [Math.min(a, c), Math.min(b, d), Math.max(a, c), Math.max(b, d)];
-  if (output[2] - output[0] < .01 || output[3] - output[1] < .01) {
-    notice("选区至少要覆盖面板宽高的 1%。", true);
+  const multi = Boolean(toolSpec()?.multi_region);
+  const minimum = multi ? .02 : .01;
+  if (output[2] - output[0] < minimum || output[3] - output[1] < minimum) {
+    notice(`选区至少要覆盖面板宽高的 ${minimum * 100}%。`, true);
     return;
   }
-  state.region = output;
+  if (multi) {
+    if (state.zones.length >= 8) {
+      notice("一次最多核对 8 块斜边选区。", true);
+      return;
+    }
+    state.zones.push({region: output, axis: "vertical"});
+  } else {
+    state.region = output;
+  }
   state.edit = null;
   state.startProbe = null;
   invalidateDraft();
   drawOverlay();
+  displayZones();
   notice("");
 }
 
@@ -395,13 +422,49 @@ function buildField(config) {
   return wrap;
 }
 
+function displayZones() {
+  const root = $("zone-list");
+  const multi = Boolean(toolSpec()?.multi_region);
+  root.hidden = !multi;
+  root.replaceChildren();
+  if (!multi) return;
+  if (!state.zones.length) {
+    root.append(node("p", "用“添加斜边选区”在相机图上拖动框选；每次拖动新增一块，逐块选择边方向。", {class: "muted"}));
+    return;
+  }
+  state.zones.forEach((zone, index) => {
+    const row = node("div", null, {class: "zone-row"});
+    const title = node("span", `Z${index + 1} · ${zone.region.map((x) => x.toFixed(2)).join(" / ")}`, {class: "zone-title"});
+    const axis = node("select", null, {"aria-label": `Z${index + 1} 边线方向`});
+    setOptions(axis, [["vertical", "纵向边"], ["horizontal", "横向边"]], zone.axis);
+    axis.addEventListener("change", () => {
+      zone.axis = axis.value;
+      invalidateDraft();
+      drawOverlay();
+    });
+    const remove = node("button", "删除", {type: "button", class: "button compact quiet"});
+    remove.addEventListener("click", () => {
+      state.zones.splice(index, 1);
+      invalidateDraft();
+      drawOverlay();
+      displayZones();
+    });
+    row.append(title, axis, remove);
+    root.append(row);
+  });
+}
+
 async function displayTool() {
   const tool = toolSpec();
   if (!tool) return;
   $("tool-description").textContent = tool.description;
   $("compare-field").hidden = !tool.comparison;
   $("options").replaceChildren(...tool.options.map(buildField));
+  $("select-region").textContent = tool.multi_region ? "添加斜边选区" : "框选分析范围";
+  $("clear-region").textContent = tool.multi_region ? "清空选区" : "全部面板";
   state.region = null;
+  state.zones = [];
+  displayZones();
   drawOverlay();
   fillComparison();
   invalidateDraft();
@@ -436,6 +499,14 @@ function currentRequest() {
     } else {
       options[field.name] = field.value;
     }
+  }
+  if (tool.multi_region) {
+    if (!state.zones.length) throw new Error("请先在图上框选至少一块斜边区域。");
+    options.zones = state.zones.map((zone, index) => ({
+      region: zone.region,
+      axis: zone.axis,
+      label: `Z${index + 1}`,
+    }));
   }
   const output = {
     tool: tool.key,
@@ -489,6 +560,16 @@ const labels = {
   dry_patches: "样本格数", source_error_x_px: "横向误差 px", source_error_y_px: "纵向误差 px",
   panel_mm: "面板毫米长度", panel_px: "面板物理像素长度", source_px: "原相机像素长度",
   dark_capture_id: "暗场标识", flat_capture_id: "平场标识", fit_rmse: "拟合均方根误差",
+  target_cycles_per_mm: "测试频率（周期/毫米）", response_floor: "响应门槛",
+  panel_size_mm: "面板尺寸（毫米）",
+  zones_total: "选区总数", zones_pass: "达标块数", zones_below: "未达门槛块数",
+  zones_unmeasurable: "测不到块数", zones_error: "无法计算块数",
+  zone: "选区", axis: "边线方向", camera_box: "原图位置（归一化）", verdict: "核对结果", detail: "说明",
+  scanlines_used: "参与扫描线", edge_fit_error_px: "边线拟合误差 px", edge_slope: "边线斜率",
+  esf_bins: "边展宽区间数", esf_samples: "参与采样支撑", samples_per_mm: "每毫米采样",
+  camera_px_per_mm: "相机每毫米像素", max_cycles_per_mm: "本区上限（周期/毫米）",
+  response_at_target: "测试频率处响应", crossing_cycles_per_mm: "门槛交叉频率（周期/毫米）",
+  relative_edge_contrast: "边对比度",
 };
 
 function valueText(value) {
@@ -765,9 +846,11 @@ on("select-region", "click", () => {
 });
 on("clear-region", "click", () => {
   state.region = null;
+  state.zones = [];
   state.edit = null;
   state.startProbe = null;
   drawOverlay();
+  displayZones();
   invalidateDraft();
 });
 on("fill-demo-log", "click", async () => {

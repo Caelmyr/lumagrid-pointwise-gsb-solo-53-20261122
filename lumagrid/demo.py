@@ -26,6 +26,7 @@ CORNERS = (
     ((.119, .142), (.934, .135), (.952, .855), (.103, .896)),
     ((.066, .122), (.914, .078), (.982, .842), (.093, .940)),
     ((-.027, .119), (.872, .097), (.921, .885), (-.038, .893)),
+    ((.050, .300), (.930, .060), (.970, .920), (.030, .660)),
 )
 
 
@@ -50,6 +51,7 @@ SOURCES = [
     DemoSource("checker", "合成·6×4 棋盘格", "checker", "checker", 4.0, .50, pose=3, seed=23),
     DemoSource("ramp", "合成·九阶灰卡", "ramp", "steps", 4.0, .52, seed=37),
     DemoSource("edge", "合成·右倾斜边", "edge", "edge", 4.0, .60, 9.0, 2, 41),
+    DemoSource("edge_card", "合成·多向斜边测试卡", "edge", "edge_card", 4.0, .60, 14.0, 5, 53),
     DemoSource("reflect", "合成·斜侧补光", "reference", "reflection", 4.0, .50, 2.0, 3, 47),
     DemoSource("band_a", "合成·条纹 4 毫秒", "uniform", "band_a", 4.0, .50, seed=11),
     DemoSource("band_b", "合成·条纹 8 毫秒", "uniform", "band_b", 8.0, .50, pose=1, seed=29),
@@ -134,6 +136,24 @@ def optics_panel(pattern: str, u: np.ndarray, v: np.ndarray):
         response = .14 + .66 * (.5 + .5 * np.tanh(distance * 270))
         response += .025 * np.cos(v * 2 * np.pi) * (distance > .013)
         return as_color(response, (0, .008, .003))
+    if pattern == "edge_card":
+        result = gray * .82 + .045
+        patches = (
+            (.50, .50, .10, .16, "v", .12),
+            (.18, .22, .10, .10, "h", .10),
+            (.80, .24, .12, .10, "h", -.12),
+            (.24, .76, .10, .14, "v", -.10),
+            (.78, .74, .12, .14, "v", .11),
+        )
+        for cu, cv, half_u, half_v, orientation, slope in patches:
+            inside = (np.abs(u - cu) < half_u) & (np.abs(v - cv) < half_v)
+            if orientation == "v":
+                distance = (u - cu) - slope * (v - cv)
+            else:
+                distance = (v - cv) - slope * (u - cu)
+            edge = .16 + .68 * (.5 + .5 * np.tanh(distance * 1000))
+            result = np.where(inside, edge, result)
+        return as_color(result, (0, .006, .002))
     if pattern == "reflection":
         bright = gray + .19 * bump(u, v, .21, .36, .017, .034)
         bright += .20 * bump(u, v, .64, .35, .024, .017)

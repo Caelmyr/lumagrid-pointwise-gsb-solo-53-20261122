@@ -7,8 +7,11 @@ from scipy.optimize import least_squares
 
 from .assays import coverage_stats, number, partition, tick
 from .inspection import Report, Scene, make_plane, stable_fraction
-from .model import Point, Problem, Region, boolean, choice, integral, numeric
-from .raster import chart_png, code_statistics, luma, masked_rgb, overlay_regions, rounding
+from .model import Point, Problem, Region, boolean, choice, integral, mapping, numeric, plain, sequence
+from .raster import (
+    chart_png, code_statistics, luma, masked_rgb, overlay_polygons, overlay_regions,
+    resize_report, rounding,
+)
 
 
 @dataclass
@@ -239,31 +242,52 @@ def threshold_crossing(freq: np.ndarray, response: np.ndarray, target: float):
     return rounding(freq[left] + (freq[right] - freq[left]) * blend, 5)
 
 
+@dataclass
+class EdgeMeasurement:
+    edge: "EdgeLine"
+    distances: np.ndarray
+    xs: np.ndarray
+    esf: np.ndarray
+    weight: np.ndarray
+    step: float
+    contrast: float
+    freq: np.ndarray
+    response: np.ndarray
+
+
+def measure_edge(plane, horizontal: bool) -> EdgeMeasurement:
+    gray = plane.gray
+    edge = fit_edge(gray, plane.observed, horizontal)
+    y, x = np.indices(gray.shape)
+    distances = edge.distance(x, y)
+    xs, esf, weight, step, contrast = binned_spread(gray, distances, plane.observed)
+    freq, response = mtf_response(esf, step)
+    return EdgeMeasurement(edge, distances, xs, esf, weight, step, contrast, freq, response)
+
+
 def sharpness(scene: Scene, second, region: Region, options: dict) -> Report:
     scene.require_role({"edge"}, "请选择包含斜边图案的采集。")
     direction = choice(options.get("axis"), {"vertical", "horizontal"}, "边线方向", default="vertical")
     plane = make_plane(scene, region, max_side=1050)
     plane.require_coverage(.62)
-    gray = plane.gray
-    edge = fit_edge(gray, plane.observed, direction == "horizontal")
-    y, x = np.indices(gray.shape)
-    distances = edge.distance(x, y)
-    xs, esf, weight, step, contrast = binned_spread(gray, distances, plane.observed)
-    freq, response = mtf_response(esf, step)
+    measured = measure_edge(plane, direction == "horizontal")
+    edge = measured.edge
+    xs, esf, weight = measured.xs, measured.esf, measured.weight
+    freq, response = measured.freq, measured.response
     metrics = {
         **plane.info(),
         "direction": direction,
         "edge_slope": rounding(edge.slope, 5),
         "edge_fit_error_px": rounding(edge.residual_px, 4),
         "scanlines_used": edge.used_scanlines,
-        "relative_edge_contrast": rounding(contrast),
+        "relative_edge_contrast": rounding(measured.contrast),
         "mtf50_cycles_per_sample": threshold_crossing(freq, response, .50),
         "mtf10_cycles_per_sample": threshold_crossing(freq, response, .10),
     }
     rows = [{"cycles_per_sample": rounding(f), "relative_response": rounding(a)}
             for f, a in zip(freq, response, strict=True)]
     report = Report("斜边清晰度", "从适当倾斜的明暗边估算法向的空间频率响应。", metrics, rows)
-    highlighted = np.where((np.abs(distances) < .65)[..., None], [.34, .91, .72], plane.rgb)
+    highlighted = np.where((np.abs(measured.distances) < .65)[..., None], [.34, .91, .72], plane.rgb)
     report.image("slanted-edge.png", masked_rgb(highlighted, plane.observed))
     report.add("mtf.png", chart_png(
         [("MTF", freq, response)],
@@ -281,6 +305,239 @@ def sharpness(scene: Scene, second, region: Region, options: dict) -> Report:
     report.warnings.append("频率单位是展平图上的采样单元，结果包含当前采集链和重采样影响。")
     if metrics["mtf50_cycles_per_sample"] is None:
         report.warnings.append("MTF 在工作图奈奎斯特频率前未跌破 50%，不外推。")
+    return report
+
+
+MAX_EDGE_ZONES = 8
+ZONE_VERDICTS = {"pass": "达标", "below": "未达门槛", "unmeasurable": "测不到", "error": "无法计算"}
+ZONE_COLORS = {
+    "pass": (126, 222, 171),
+    "below": (242, 141, 96),
+    "unmeasurable": (176, 186, 198),
+    "error": (213, 137, 224),
+}
+
+
+@dataclass(frozen=True)
+class ZoneSpec:
+    index: int
+    label: str
+    region: Region
+    horizontal: bool
+
+    @property
+    def axis(self) -> str:
+        return "horizontal" if self.horizontal else "vertical"
+
+
+def parse_zone_specs(value) -> list[ZoneSpec]:
+    items = sequence(value, "斜边选区清单", minimum=1, maximum=MAX_EDGE_ZONES)
+    specs = []
+    for index, item in enumerate(items, start=1):
+        data = mapping(item, f"第 {index} 块斜边选区")
+        region = Region.parse(data.get("region"), minimum=.02)
+        axis = choice(data.get("axis"), {"vertical", "horizontal"},
+                      f"第 {index} 块边线方向", default="vertical")
+        label = plain(data.get("label"), f"第 {index} 块选区名称", 40) or f"Z{index}"
+        specs.append(ZoneSpec(index, label, region, axis == "horizontal"))
+    return specs
+
+
+def zone_camera_box(scene: Scene, region: Region) -> list:
+    quad = scene.calibration.camera_rectangle(region)
+    xs = [point[0] for point in quad]
+    ys = [point[1] for point in quad]
+    return [rounding(min(xs), 4), rounding(min(ys), 4),
+            rounding(max(xs), 4), rounding(max(ys), 4)]
+
+
+def normal_scale(edge: EdgeLine) -> tuple[float, float]:
+    scale = np.hypot(1.0, edge.slope)
+    if edge.horizontal:
+        return abs(edge.slope) / scale, 1.0 / scale
+    return 1.0 / scale, abs(edge.slope) / scale
+
+
+def camera_pitch_per_mm(scene: Scene, plane, mm_per_sample: tuple[float, float]):
+    """沿网格两轴、每一面板毫米背后的相机像素数，取选区内偏弱支撑的分位值。"""
+    height, width = plane.shape
+    points = plane.points.reshape(-1, 2)
+    camera = scene.calibration.panel_to_camera(points).reshape(height, width, 2)
+    source_width, source_height = scene.image.size
+    camera = camera * np.asarray([source_width - 1, source_height - 1])
+    pitches = []
+    for axis, step_mm, valid in (
+        (1, mm_per_sample[0], plane.observed[:, 1:] & plane.observed[:, :-1]),
+        (0, mm_per_sample[1], plane.observed[1:, :] & plane.observed[:-1, :]),
+    ):
+        delta = np.linalg.norm(np.diff(camera, axis=axis), axis=-1)
+        samples = delta[valid] / step_mm
+        pitches.append(float(np.percentile(samples, 5)) if samples.size else None)
+    return tuple(pitches)
+
+
+@dataclass
+class ZoneResult:
+    spec: ZoneSpec
+    verdict: str
+    detail: str
+    plane: object = None
+    measured: EdgeMeasurement | None = None
+    freq_mm: np.ndarray | None = None
+    response_at_target: float | None = None
+    crossing: float | None = None
+    samples_per_mm: float | None = None
+    camera_px_per_mm: float | None = None
+    max_cycles_per_mm: float | None = None
+    camera_box: list | None = None
+
+
+def evaluate_zone(scene: Scene, spec: ZoneSpec, panel_mm, target: float, floor: float) -> ZoneResult:
+    box = zone_camera_box(scene, spec.region)
+    plane = make_plane(scene, spec.region, max_side=1050)
+    plane.require_coverage(.62)
+    measured = measure_edge(plane, spec.horizontal)
+    height, width = plane.shape
+    panel_width_mm, panel_height_mm = panel_mm
+    mm_per_sample = (
+        (spec.region.right - spec.region.left) * panel_width_mm / width,
+        (spec.region.bottom - spec.region.top) * panel_height_mm / height,
+    )
+    normal_x, normal_y = normal_scale(measured.edge)
+    normal_mm = float(np.hypot(normal_x * mm_per_sample[0], normal_y * mm_per_sample[1]))
+    samples_per_mm = 1.0 / normal_mm
+    pitch_x, pitch_y = camera_pitch_per_mm(scene, plane, mm_per_sample)
+    camera_terms = [term for term in (
+        (normal_x / pitch_x) ** 2 if pitch_x else None,
+        (normal_y / pitch_y) ** 2 if pitch_y else None,
+    ) if term is not None]
+    camera_px_per_mm = float(1.0 / np.sqrt(sum(camera_terms))) if camera_terms else None
+    limits = [.5 * samples_per_mm]
+    if camera_px_per_mm:
+        limits.append(.5 * camera_px_per_mm)
+    max_frequency = min(limits)
+    freq_mm = measured.freq * samples_per_mm
+    crossing = threshold_crossing(freq_mm, measured.response, floor)
+    if target > max_frequency:
+        detail = f"本区沿边法线最高支持约 {max_frequency:.2f} 周期/毫米"
+        return ZoneResult(spec, "unmeasurable", detail, plane, measured, freq_mm,
+                          None, crossing, samples_per_mm, camera_px_per_mm, max_frequency, box)
+    response_at = float(np.interp(target, freq_mm, measured.response))
+    verdict = "pass" if response_at >= floor else "below"
+    relation = "≥" if verdict == "pass" else "<"
+    detail = f"测试频率处响应 {response_at:.3f} {relation} 门槛 {rounding(floor)}"
+    return ZoneResult(spec, verdict, detail, plane, measured, freq_mm, response_at,
+                      crossing, samples_per_mm, camera_px_per_mm, max_frequency, box)
+
+
+def zone_row(result: ZoneResult) -> dict:
+    spec = result.spec
+    row = {
+        "zone": spec.label,
+        "axis": spec.axis,
+        "region": [rounding(value, 4) for value in spec.region.values()],
+        "camera_box": result.camera_box,
+        "verdict": ZONE_VERDICTS[result.verdict],
+        "detail": result.detail,
+    }
+    if result.plane is not None:
+        height, width = result.plane.shape
+        row["working_size"] = [width, height]
+        row["coverage_pct"] = rounding(result.plane.coverage * 100, 2)
+    if result.measured is not None:
+        row.update({
+            "scanlines_used": result.measured.edge.used_scanlines,
+            "edge_fit_error_px": rounding(result.measured.edge.residual_px, 4),
+            "edge_slope": rounding(result.measured.edge.slope, 5),
+            "esf_bins": int(np.count_nonzero(result.measured.weight)),
+            "esf_samples": int(result.measured.weight.sum()),
+            "relative_edge_contrast": rounding(result.measured.contrast),
+            "samples_per_mm": rounding(result.samples_per_mm),
+            "camera_px_per_mm": rounding(result.camera_px_per_mm) if result.camera_px_per_mm else None,
+            "max_cycles_per_mm": rounding(result.max_cycles_per_mm),
+            "response_at_target": rounding(result.response_at_target) if result.response_at_target is not None else None,
+            "crossing_cycles_per_mm": result.crossing,
+        })
+    return row
+
+
+def sharpness_zones(scene: Scene, second, region: Region, options: dict) -> Report:
+    scene.require_role({"edge"}, "请选择包含斜边图案的采集。")
+    specs = parse_zone_specs(options.get("zones"))
+    target = numeric(options.get("frequency"), "测试频率（周期/毫米）", .02, 50, default=.5)
+    floor = numeric(options.get("floor"), "响应门槛", .05, .95, default=.5)
+    panel = scene.panel
+    if panel["width_mm"] is None or panel["height_mm"] is None:
+        raise Problem("多区核对按每毫米测试频率比较，需要面板资料填写有效宽度和高度的毫米尺寸。")
+    panel_mm = float(panel["width_mm"]), float(panel["height_mm"])
+    results = []
+    for spec in specs:
+        try:
+            results.append(evaluate_zone(scene, spec, panel_mm, target, floor))
+        except Problem as exc:
+            results.append(ZoneResult(spec, "error", str(exc),
+                                      camera_box=zone_camera_box(scene, spec.region)))
+    if all(item.verdict == "error" for item in results):
+        raise Problem(f"所有选区都无法计算：{results[0].detail}")
+    counts = {key: sum(1 for item in results if item.verdict == key) for key in ZONE_VERDICTS}
+    metrics = {
+        "panel_size_mm": [rounding(panel_mm[0], 3), rounding(panel_mm[1], 3)],
+        "target_cycles_per_mm": rounding(target),
+        "response_floor": rounding(floor),
+        "zones_total": len(results),
+        "zones_pass": counts["pass"],
+        "zones_below": counts["below"],
+        "zones_unmeasurable": counts["unmeasurable"],
+        "zones_error": counts["error"],
+    }
+    rows = [zone_row(item) for item in results]
+    report = Report("斜边多区清晰度核对",
+                    "同一测试频率与响应门槛下核对多块斜边选区；采样不足的区块记为测不到。",
+                    metrics, rows)
+    base = resize_report(masked_rgb(scene.image.rgb, scene.image.valid))
+    shapes = [
+        (scene.calibration.camera_rectangle(item.spec.region), item.spec.label, ZONE_COLORS[item.verdict])
+        for item in results
+    ]
+    report.image("zones-camera.png", overlay_polygons(base, shapes))
+    for item in results:
+        if item.measured is None:
+            continue
+        band = (np.abs(item.measured.distances) < .65)[..., None]
+        highlighted = np.where(band, [.34, .91, .72], item.plane.rgb)
+        report.image(f"zone-{item.spec.index}-edge.png", masked_rgb(highlighted, item.plane.observed))
+    checked = [item for item in results if item.verdict in {"pass", "below"}]
+    if checked:
+        x_max = max(target * 1.25, max(float(item.freq_mm[-1]) for item in checked))
+        series = [(item.spec.label, item.freq_mm, item.measured.response) for item in checked]
+        series.append(("Response floor", np.asarray([0.0, x_max]), np.asarray([floor, floor])))
+        report.add("mtf-zones.png", chart_png(
+            series, x_label="Cycles per millimetre", y_label="Normalized response",
+            x_bounds=(0, rounding(x_max, 4)), y_bounds=(0, 1.05),
+            markers=[(target, "Target")],
+        ), "image/png")
+    report.table("zones.csv", rows)
+    report.table("mtf-zones.csv", [
+        {"zone": item.spec.label, "cycles_per_mm": rounding(f), "relative_response": rounding(a)}
+        for item in checked for f, a in zip(item.freq_mm, item.measured.response, strict=True)
+    ])
+    report.table("edge-samples.csv", [
+        {"zone": item.spec.label, "distance_mm": rounding(x / item.samples_per_mm),
+         "normalized_code": rounding(y), "samples": int(n)}
+        for item in results if item.measured is not None
+        for x, y, n in zip(item.measured.xs, item.measured.esf, item.measured.weight, strict=True)
+    ])
+    for item in results:
+        if item.verdict == "unmeasurable":
+            report.warnings.append(
+                f"{item.spec.label}：{item.detail}，低于测试频率 {rounding(target)}，"
+                "记为测不到，不按未通过处理，也不套用其他选区结果。"
+            )
+        elif item.verdict == "error":
+            report.warnings.append(f"{item.spec.label}：无法计算（{item.detail}）。")
+    report.warnings.append("频率按各选区实际的每毫米采样换算；斜拍边角的可用频率受相机局部采样限制。")
+    if counts["unmeasurable"]:
+        report.warnings.append("测不到的选区需要更细的局部采样（缩短拍摄距离或减小倾斜）才能在该频率核对。")
     return report
 
 
@@ -344,6 +601,17 @@ def configs():
             "description": "从单条斜边估算边展宽、MTF50 和 MTF10。",
             "run": sharpness,
             "options": [axis_option("vertical")],
+        },
+        "mtf_zones": {
+            "title": "斜边多区核对",
+            "group": "采样与细节",
+            "description": "在同一张斜边图上框选多块区域并各选边方向，按统一的每毫米测试频率与响应门槛核对；采样不足的区块记为测不到。",
+            "multi_region": True,
+            "run": sharpness_zones,
+            "options": [
+                number("frequency", "测试频率（周期/毫米）", .5, .02, 50, .05),
+                number("floor", "响应门槛", .5, .05, .95, .05),
+            ],
         },
         "profile": {
             "title": "面板剖面",

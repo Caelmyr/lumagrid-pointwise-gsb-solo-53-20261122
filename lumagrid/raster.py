@@ -223,6 +223,30 @@ def overlay_regions(
     return result
 
 
+def overlay_polygons(
+    image: Image.Image,
+    shapes: list[tuple[list[tuple[float, float]], str, tuple]],
+) -> Image.Image:
+    result = image.copy()
+    draw = ImageDraw.Draw(result)
+    width, height = result.size
+    for points, text, color in shapes:
+        polygon = [
+            (max(0, min(width - 1, round(px * width))), max(0, min(height - 1, round(py * height))))
+            for px, py in points
+        ]
+        if len(polygon) > 2:
+            draw.line([*polygon, polygon[0]], fill=color, width=2, joint="curve")
+        if text and polygon:
+            tx, ty = polygon[0]
+            tw = ceil(draw.textlength(text))
+            tx = min(max(0, width - tw - 7), tx + 4)
+            ty = min(height - 15, ty + 4)
+            draw.rectangle((tx - 1, ty - 1, tx + tw + 4, ty + 12), fill=(21, 35, 46))
+            draw.text((tx + 1, ty), text, fill=color)
+    return result
+
+
 def side_by_side(first: Image.Image, second: Image.Image, gap: int = 7) -> Image.Image:
     result = Image.new("RGB", (first.width + second.width + gap, max(first.height, second.height)), (21, 35, 46))
     result.paste(first, (0, 0))
