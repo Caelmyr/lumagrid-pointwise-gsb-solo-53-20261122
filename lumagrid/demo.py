@@ -66,6 +66,9 @@ SOURCES = [
     DemoSource("module_seam", "合成·拼接模块画面", "uniform", "module_seam", 4.0, .50, seed=62),
     DemoSource("display_rim", "合成·发光画面内沿", "uniform", "display_rim", 4.0, .55, 0.0, 2, 73),
     DemoSource("dark_repeat", "合成·镜头暗场复拍", "dark", "dark", 4.0, 0.0, seed=101),
+    DemoSource("flicker_a", "合成·滚动条纹 20 微秒", "uniform", "flicker_a", 4.0, .50, seed=141),
+    DemoSource("flicker_b", "合成·滚动条纹 400 微秒", "uniform", "flicker_b", 4.0, .50, seed=143),
+    DemoSource("flicker_c", "合成·滚动条纹 35 微秒", "uniform", "flicker_c", 4.0, .50, seed=147),
 ]
 
 
@@ -226,10 +229,35 @@ def synth_macro(seed: int) -> np.ndarray:
     return np.clip(photo + noise, 0, 1)
 
 
+FLICKER_DEMO_HZ = 3_200.0
+FLICKER_ROW_TIMES_US = {"flicker_a": 20.0, "flicker_b": 400.0, "flicker_c": 35.0}
+
+
+def synth_rolling_stripes(pattern: str, seed: int) -> np.ndarray:
+    """Camera-space horizontal stripes as a rolling shutter would record them.
+
+    These are deliberately drawn in camera rows (not panel coordinates and not
+    perspective-warped) so they can exercise the stripe-frequency tool, which
+    assumes exposure advances one camera row at a time.
+    """
+    row_time = FLICKER_ROW_TIMES_US[pattern] * 1e-6
+    cycles_per_row = FLICKER_DEMO_HZ * row_time
+    y = np.arange(HEIGHT, dtype=np.float64)[:, None]
+    x = np.arange(WIDTH, dtype=np.float64)[None, :]
+    shading = .44 + .035 * np.cos(2 * np.pi * (y / HEIGHT) * .6) + .012 * np.cos(2 * np.pi * x / WIDTH)
+    stripe = .042 * np.sin(2 * np.pi * cycles_per_row * y + .3)
+    harmonic = .006 * np.sin(2 * np.pi * 2 * cycles_per_row * y - .7)
+    base = shading + stripe + harmonic
+    noise = np.random.default_rng(seed).normal(0, .0011, base.shape)
+    return np.clip(np.stack([base + noise] * 3, axis=-1), 0, 1)
+
+
 def synth_capture(source: DemoSource):
     if source.photo in {"dark", "flat"}:
         photo = sensor_reference(source.photo, source.seed)
         return photo, None
+    if source.photo.startswith("flicker_"):
+        return synth_rolling_stripes(source.photo, source.seed), None
     if source.photo == "macro":
         return synth_macro(source.seed), None
     calibration = Calibration.from_raw(CORNERS[source.pose])

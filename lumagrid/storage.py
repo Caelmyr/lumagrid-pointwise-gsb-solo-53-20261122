@@ -85,6 +85,16 @@ CREATE TABLE IF NOT EXISTS decisions (
  note TEXT NOT NULL,
  created TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS inspection_captures (
+ inspection_id TEXT NOT NULL REFERENCES inspections(id),
+ capture_id TEXT NOT NULL REFERENCES captures(id),
+ position INTEGER NOT NULL,
+ calibration_id TEXT,
+ region TEXT NOT NULL,
+ row_time_us REAL,
+ PRIMARY KEY(inspection_id, position),
+ UNIQUE(inspection_id, capture_id)
+);
 CREATE TABLE IF NOT EXISTS markers (
  id TEXT PRIMARY KEY,
  panel_id TEXT NOT NULL REFERENCES panels(id),
@@ -100,7 +110,8 @@ CREATE INDEX IF NOT EXISTS capture_panel ON captures(panel_id, created DESC);
 CREATE INDEX IF NOT EXISTS inspection_panel ON inspections(panel_id, created DESC);
 CREATE INDEX IF NOT EXISTS markers_capture ON markers(capture_id, created DESC);
 CREATE INDEX IF NOT EXISTS decisions_inspection ON decisions(inspection_id, created);
-PRAGMA user_version=1;
+CREATE INDEX IF NOT EXISTS inspection_captures_capture ON inspection_captures(capture_id);
+PRAGMA user_version=2;
 """
 
 MAX_PANELS = 150
@@ -152,7 +163,7 @@ class Store:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RuntimeError("不兼容的工作库版本")
             conn.executescript(SCHEMA)
 
@@ -170,7 +181,7 @@ class Store:
     def health(self) -> dict:
         with self.connect() as conn:
             conn.execute("SELECT id FROM panels LIMIT 1").fetchone()
-        return {"status": "ok", "schema": 1}
+        return {"status": "ok", "schema": 2}
 
     def panels(self, search: str = "") -> list[dict]:
         with self.connect() as conn:
@@ -393,7 +404,8 @@ class Store:
             return self.panel_view(conn, self.require_panel(conn, panel_id))
 
     def add_inspection(self, capture: dict, comparison: dict | None, tool: str, title: str,
-                       request: dict, report: dict, files: dict[str, tuple[bytes, str]]) -> dict:
+                       request: dict, report: dict, files: dict[str, tuple[bytes, str]],
+                       sessions: list[dict] | None = None) -> dict:
         with self.connect() as conn, transaction(conn):
             panel_id = capture["panel_id"]
             if comparison and comparison["panel_id"] != panel_id:
@@ -409,6 +421,20 @@ class Store:
             for name, (data, mime) in files.items():
                 checksum = self.blob(conn, data, mime)
                 conn.execute("INSERT INTO inspection_files VALUES (?, ?, ?)", (uid, name, checksum))
+            for position, entry in enumerate(sessions or [], start=1):
+                session_capture = self.require_capture(conn, entry["capture_id"])
+                if session_capture["panel_id"] != panel_id:
+                    raise Problem("参与核对的采集不在当前面板中。")
+                if entry.get("calibration_id") not in (None, "identity"):
+                    require_row(conn.execute(
+                        "SELECT id FROM calibrations WHERE id = ? AND capture_id = ?",
+                        (entry["calibration_id"], entry["capture_id"]),
+                    ).fetchone(), "参与核对的角点校准")
+                conn.execute(
+                    "INSERT INTO inspection_captures VALUES (?, ?, ?, ?, ?, ?)",
+                    (uid, entry["capture_id"], position, entry.get("calibration_id"),
+                     encode(entry["region"]), entry.get("row_time_us")),
+                )
             self.touch(conn, panel_id)
             return self.inspection_view(conn, self.require_inspection(conn, uid))
 
@@ -427,6 +453,13 @@ class Store:
             (row["id"],),
         ).fetchall()
         result["files"] = [dict(file) for file in files]
+        sessions = conn.execute(
+            "SELECT s.capture_id, s.position, s.calibration_id, s.region, s.row_time_us, "
+            "c.title, c.role FROM inspection_captures s JOIN captures c ON s.capture_id = c.id "
+            "WHERE s.inspection_id = ? ORDER BY s.position",
+            (row["id"],),
+        ).fetchall()
+        result["sessions"] = [row_json(entry, decode=("region",)) for entry in sessions]
         return result
 
     def inspection(self, inspection_id: str) -> dict:
@@ -536,10 +569,20 @@ class Store:
                     seen.add(checksum)
                     captures.append((capture, calibration, actual))
                 files = {item["name"]: self.read_blob(conn, item["checksum"])[0] for item in inspection["files"]}
+                sessions = []
+                for session in inspection.get("sessions") or []:
+                    capture = self.capture_view(conn, self.require_capture(conn, session["capture_id"]))
+                    calibration = self.calibration(conn, session["capture_id"],
+                                                   session["calibration_id"] or "identity")
+                    checksum = capture["original"]
+                    actual = self.read_blob(conn, checksum)[0] if include_sources and checksum not in seen else None
+                    seen.add(checksum)
+                    sessions.append((capture, calibration, actual))
                 result.append({
                     "inspection": inspection,
                     "files": files,
                     "captures": captures,
+                    "sessions": sessions,
                     "decisions": self.decision_rows(conn, inspection_id),
                 })
             return panel, result

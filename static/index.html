@@ -44,6 +44,7 @@
         <nav class="tabs" aria-label="工作区">
           <button class="active" data-tab="capture">检查工作台</button>
           <button data-tab="records">复核与交接</button>
+          <button data-tab="flicker">条纹频率核对</button>
           <button data-tab="timing">时钟配对</button>
           <button data-tab="backdrop">镜头校正</button>
           <button data-tab="intake">采集包</button>
@@ -100,6 +101,23 @@
             <form id="verify-form" class="inline-actions" enctype="multipart/form-data"><label>选择 ZIP 文件<input name="archive" type="file" accept=".zip" required></label><button class="button quiet">检查内容哈希</button></form>
             <p id="verify-result" class="muted"></p>
           </section>
+        </section>
+        <section class="tab-panel" id="tab-flicker" hidden>
+          <form id="flicker-form" class="session-form">
+            <h2>多图条纹闪烁频率核对</h2>
+            <p class="muted">选择同一面板的两到三张逐行读出设置不同的原图。在条纹清楚的相机原像素位置分别框选，填入相邻两行的读出时间差。结果给出这些照片能共同支持的闪烁频率段，并说明每段在各张原图上对应的条纹周期。看不到条纹的图会标为证据不足，不会用来排除其它图的频率。</p>
+            <div id="flicker-slots"></div>
+            <div class="form-grid">
+              <label>频率范围下限（赫兹）<input name="freq_min" type="number" value="100" min=".1" max="60000" step="1" required></label>
+              <label>频率范围上限（赫兹）<input name="freq_max" type="number" value="3000" min=".1" max="60000" step="1" required></label>
+              <label>条纹周期容差（%）<input name="tolerance_pct" type="number" value="2" min=".2" max="25" step=".1" required></label>
+              <label>最低谱峰突出度<input name="min_strength" type="number" value="3.6" min="1.5" max="60" step=".1" required></label>
+              <label>最低条纹幅度（码值）<input name="min_amplitude" type="number" value=".0009" min="0" max=".25" step=".0001" required></label>
+              <label>检查名称（可选）<input name="title" maxlength="110" placeholder="保存时作为记录名称"></label>
+            </div>
+            <div class="inline-actions"><button class="button primary" id="flicker-preview" name="preview" type="submit">运行核对</button><button class="button quiet" id="flicker-save" name="save" type="submit">保存复核记录</button></div>
+          </form>
+          <section id="flicker-report" class="report" hidden></section>
         </section>
         <section class="tab-panel" id="tab-timing" hidden>
           <form id="timing-form" class="session-form">

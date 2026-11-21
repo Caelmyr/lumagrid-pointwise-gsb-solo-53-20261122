@@ -166,12 +166,14 @@ def prepare_bundle(store: Store, panel_id: str, inspections: list[str], include_
             attachments.append(target)
         sources = [source_registration(bundle, capture, calibration, payload)
                    for capture, calibration, payload in group["captures"]]
+        sessions = [source_registration(bundle, capture, calibration, payload)
+                    for capture, calibration, payload in group.get("sessions", [])]
         meta["inspections"].append({
             "id": key,
             "title": record["title"],
             "tool": record["tool"],
             "state": record["state"],
-            "source_ids": [source["capture_id"] for source in sources],
+            "source_ids": [source["capture_id"] for source in sources + sessions],
             "attachments": attachments,
         })
         last = group["decisions"][-1] if group["decisions"] else {}

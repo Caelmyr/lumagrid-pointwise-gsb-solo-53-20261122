@@ -10,6 +10,7 @@ from werkzeug.exceptions import HTTPException
 
 from .calibration_tools import flatfield_report
 from .demo import demo_trigger_log, install as install_demo
+from .flicker import flicker_report
 from .geometry import Calibration, segment_statistics
 from .handoff import inspect_bundle_content, prepare_bundle
 from .inspection import Scene, execute, public_tools
@@ -272,6 +273,28 @@ def create_app(data_root: Path | None = None):
             primary, None, "timing", "采集时钟配对", snapshot, report.as_json(), report.files,
         )
         return {"record": record, "result": report_preview(report, snapshot)}, 201
+
+    @app.post("/api/panels/<panel_id>/flicker")
+    def flicker(panel_id):
+        data = args_json()
+        scans, snapshot, report = flicker_report(store, panel_id, data)
+        if not boolean(data.get("save"), "保存检查", default=False):
+            return report_preview(report, snapshot)
+        title = plain(data.get("title"), "检查名称", 110, default=report.title)
+        saved = store.add_inspection(
+            scans[0].capture.scene.capture, None, "flicker", title, snapshot,
+            report.as_json(), report.files,
+            [
+                {
+                    "capture_id": scan.capture.capture_id,
+                    "calibration_id": scan.capture.scene.revision_id,
+                    "region": scan.capture.region.values(),
+                    "row_time_us": scan.capture.row_time_us,
+                }
+                for scan in scans
+            ],
+        )
+        return {"record": saved, "result": report_preview(report, snapshot)}, 201
 
     @app.post("/api/captures/<capture_id>/flatfield")
     def flatfield(capture_id):

@@ -4,7 +4,7 @@ const state = {
   panels: [], panel: null, captures: [], capture: null,
   calibrations: [], compareCalibrations: [], region: null,
   edit: null, cornerDraft: [], startProbe: null,
-  draftResult: null, activeTab: "capture",
+  draftResult: null, activeTab: "capture", flicker: [], flickerEditing: null,
   records: [], record: null, checkedRecords: new Set(),
   requestSerial: 0, recordSerial: 0, currentSearch: 0,
 };
@@ -135,6 +135,8 @@ async function selectPanel(panel, preferred = null) {
     part.hidden = part.id !== "tab-capture";
   });
   localStorage.setItem("lumagrid.panel", panel.id);
+  state.flicker = [];
+  state.flickerEditing = null;
   $("capture-filter").value = "";
   $("record-detail").replaceChildren(node("p", "选择一条记录，查看当时的图像和标定版本。", {class: "muted"}));
   for (const id of ["report", "timing-report", "flatfield-report"]) $(id).hidden = true;
@@ -162,6 +164,7 @@ async function refreshCaptures() {
   fillCorrectionFields();
   fillComparison();
   if (state.activeTab === "intake") packetMembers();
+  if (state.activeTab === "flicker") displayFlickerSlots();
 }
 
 async function selectCapture(capture) {
@@ -489,6 +492,22 @@ const labels = {
   dry_patches: "样本格数", source_error_x_px: "横向误差 px", source_error_y_px: "纵向误差 px",
   panel_mm: "面板毫米长度", panel_px: "面板物理像素长度", source_px: "原相机像素长度",
   dark_capture_id: "暗场标识", flat_capture_id: "平场标识", fit_rmse: "拟合均方根误差",
+  frequency_range_hz: "频率范围 Hz", captures_in_check: "参与核对张数", captures_measured: "测到条纹张数",
+  captures_insufficient: "证据不足张数", common_band_count: "共同支持频段数",
+  period_tolerance_pct: "周期容差 %", row_times_us: "逐行读出时间 µs",
+  band: "频段", band_low_hz: "频段下限 Hz", band_high_hz: "频段上限 Hz",
+  explanation: "折叠解释", explanation_low_hz: "解释下限 Hz", explanation_high_hz: "解释上限 Hz",
+  image: "图号", title: "采集", row_time_us: "行时 µs", region_pixels: "原像素选区",
+  region_normalized: "归一化选区", region_rows: "选区行数", region_columns: "选区列数",
+  row_coverage_pct: "完整行 %", state: "状态", note: "说明", stripe_candidates: "条纹候选数",
+  strongest_period_rows: "最强周期（行）", strongest_amplitude_code: "最强幅度（码值）",
+  strongest_lag_correlation: "最强逐行重复性", stripe: "条纹", period_rows: "条纹周期（行）",
+  period_ms: "条纹周期（毫秒）", fold: "折叠级次", image_1: "第 1 张", image_2: "第 2 张",
+  image_3: "第 3 张", stripe_1: "第 1 张条纹", stripe_2: "第 2 张条纹", stripe_3: "第 3 张条纹",
+  period_rows_1: "第 1 张周期（行）", period_rows_2: "第 2 张周期（行）",
+  period_rows_3: "第 3 张周期（行）", period_ms_1: "第 1 张周期（毫秒）",
+  period_ms_2: "第 2 张周期（毫秒）", period_ms_3: "第 3 张周期（毫秒）",
+  fold_1: "第 1 张折叠", fold_2: "第 2 张折叠", fold_3: "第 3 张折叠",
 };
 
 function valueText(value) {
@@ -507,6 +526,7 @@ function showReport(destination, report, savedRecord) {
   if (report.metrics) {
     const matrix = node("dl", null, {class: "metric-grid"});
     for (const [key, value] of Object.entries(report.metrics)) {
+      if (key === "images") continue;
       const cell = node("div");
       cell.append(node("dt", labels[key] || key.replaceAll("_", " ")), node("dd", valueText(value)));
       matrix.append(cell);
@@ -517,6 +537,16 @@ function showReport(destination, report, savedRecord) {
     const warnings = node("ul", null, {class: "warning-list"});
     warnings.append(...report.warnings.map((item) => node("li", item)));
     destination.append(warnings);
+  }
+  if (report.metrics?.images) {
+    const strip = node("div", null, {class: "report-image-strip"});
+    report.metrics.images.forEach((entry, index) => {
+      const card = node("div", null, {class: "report-image-card"});
+      card.append(node("b", `第 ${index + 1} 张 · ${entry.title}`),
+        node("span", `${entry.state}${entry.row_time_us ? ` · 行时 ${entry.row_time_us} 微秒` : ""}`));
+      strip.append(card);
+    });
+    destination.append(strip);
   }
   const images = node("div", null, {class: "report-gallery"});
   const files = node("div", null, {class: "inline-actions"});
@@ -636,9 +666,31 @@ async function selectRecord(id) {
   const rev = record.request?.source?.calibration_revision;
   const compareRev = record.request?.comparison?.calibration_revision;
   const source = record.request?.source?.capture_title;
-  const matters = [current, source, rev ? `主图标定 v${rev}` : "主图整图坐标", compareRev ? `对照标定 v${compareRev}` : ""];
+  const sessions = record.request?.captures || [];
+  const matters = [current, source, rev ? `主图标定 v${rev}` : "主图整图坐标",
+    compareRev ? `对照标定 v${compareRev}` : "",
+    sessions.length ? `${sessions.length} 张原图参与核对` : ""];
   summary.append(node("h2", record.title), node("p", matters.filter(Boolean).join(" · "), {class: "muted"}));
   detail.append(summary);
+  if (sessions.length) {
+    const used = node("section", null, {class: "record-request"});
+    used.append(node("h3", "本次使用的原图区域与参数"));
+    const list = node("ul");
+    for (const entry of sessions) {
+      const pixels = entry.region_pixels ? `原像素 ${entry.region_pixels.join(" / ")}` : "";
+      const region = entry.region ? `归一化 ${entry.region.map((value) => Number(value).toFixed(3)).join(" / ")}` : "";
+      const timing = entry.row_time_us ? `行时 ${entry.row_time_us} 微秒` : "";
+      const state = entry.state ? ` · ${entry.state}` : "";
+      list.append(node("li", [entry.capture_title, timing, pixels || region, state].filter(Boolean).join(" · ")));
+    }
+    used.append(list);
+    const range = record.request.frequency_range_hz;
+    if (range) {
+      const options = record.request.options || {};
+      used.append(node("p", `频率范围 ${range[0]}～${range[1]} Hz · 周期容差 ${options.tolerance_pct}% · 最低谱峰突出度 ${options.min_strength} · 最低幅度 ${options.min_amplitude}`, {class: "muted"}));
+    }
+    detail.append(used);
+  }
   if (decisions.length) {
     const log = node("ul", null, {class: "decision-log"});
     for (const row of decisions) {
@@ -770,6 +822,10 @@ on("clear-region", "click", () => {
   drawOverlay();
   invalidateDraft();
 });
+on("flicker-form", "submit", async (event) => {
+  event.preventDefault();
+  await runFlicker(event.submitter?.name === "save");
+});
 on("fill-demo-log", "click", async () => {
   const result = await fetch("/api/demo/reference-log");
   if (!result.ok) throw new Error("读取合成参考日志失败。");
@@ -817,6 +873,7 @@ document.querySelectorAll("[data-tab]").forEach((tab) => {
       catch (error) { notice(error.message, true); }
     } else if (state.activeTab === "backdrop") fillCorrectionFields();
     else if (state.activeTab === "intake") packetMembers();
+    else if (state.activeTab === "flicker") displayFlickerSlots();
   });
 });
 
@@ -885,6 +942,237 @@ on("packet-import", "submit", async (event) => {
   }
 });
 
+const FLICKER_SLOT_COUNT = 3;
+const FLICKER_STORE = "lumagrid.flicker";
+
+function restoreFlicker() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FLICKER_STORE) || "null");
+    if (saved && Array.isArray(saved.slots)) {
+      state.flicker = saved.slots.slice(0, FLICKER_SLOT_COUNT);
+    }
+  } catch {
+    state.flicker = [];
+  }
+}
+
+function persistFlicker() {
+  try {
+    const panel = state.panel?.id || "";
+    localStorage.setItem(FLICKER_STORE, JSON.stringify({panel, slots: state.flicker}));
+  } catch {
+    /* local storage is optional */
+  }
+}
+
+function flickerBusy() {
+  $("flicker-preview").disabled = true;
+  $("flicker-save").disabled = true;
+}
+
+function flickerIdle() {
+  $("flicker-preview").disabled = false;
+  $("flicker-save").disabled = false;
+}
+
+function addFlickerSlot() {
+  if (state.flicker.length >= FLICKER_SLOT_COUNT) return;
+  state.flicker.push({capture_id: "", row_time_us: "", region: null});
+  persistFlicker();
+  displayFlickerSlots();
+}
+
+function removeFlickerSlot(index) {
+  state.flicker.splice(index, 1);
+  persistFlicker();
+  displayFlickerSlots();
+}
+
+function flickerImage(entry) {
+  return `/api/captures/${escapePath(entry.capture_id)}/preview`;
+}
+
+function flickerOverlay(entry) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 1000 1000");
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("class", "flicker-overlay");
+  svg.setAttribute("aria-hidden", "true");
+  if (entry.region) {
+    const [left, top, right, bottom] = entry.region;
+    const polygon = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+    polygon.setAttribute("points", `${left * 1000},${top * 1000} ${right * 1000},${top * 1000} ` +
+      `${right * 1000},${bottom * 1000} ${left * 1000},${bottom * 1000}`);
+    polygon.setAttribute("stroke-dasharray", "6 4");
+    svg.append(polygon);
+  }
+  return svg;
+}
+
+function flickerSlot(index, entry) {
+  const slot = node("section", null, {class: "flicker-slot"});
+  const head = node("header");
+  head.append(node("h3", `第 ${index + 1} 张`));
+  if (state.flicker.length > 2) {
+    const remove = node("button", "移除此张", {type: "button", class: "button compact quiet"});
+    remove.addEventListener("click", () => removeFlickerSlot(index));
+    head.append(remove);
+  }
+  slot.append(head);
+  const pick = node("div", null, {class: "flicker-pick"});
+  const select = node("select", null, {"aria-label": `第 ${index + 1} 张采集`});
+  select.replaceChildren(node("option", "选择采集", {value: ""}));
+  for (const capture of state.captures) {
+    select.append(node("option", capture.title, {value: capture.id}));
+  }
+  select.value = entry.capture_id || "";
+  const timing = node("label", "相邻两行读出时间（微秒）");
+  const timeInput = node("input", null, {
+    type: "number", name: `row_time_${index}`, min: ".05", max: "100000",
+    step: ".01", value: entry.row_time_us ?? "",
+  });
+  timing.append(timeInput);
+  pick.append(node("label", "采集图"), select, timing);
+  slot.append(pick);
+  const frame = node("div", null, {class: "image-frame"});
+  if (!entry.capture_id) {
+    frame.append(node("p", "先选择采集图，再在画面上框选条纹区域。", {class: "flicker-hint"}));
+    slot.append(frame);
+  } else {
+    const wrap = node("div", null, {class: "flicker-draw"});
+    wrap.append(
+      node("img", null, {alt: `第 ${index + 1} 张采集`, src: flickerImage(entry)}),
+      flickerOverlay(entry),
+    );
+    frame.append(wrap);
+    slot.append(frame);
+    const hint = node("p", entry.region ?
+      `选区 ${entry.region.map((value) => value.toFixed(3)).join(" / ")} · 相机原像素比例` :
+      "在画面上拖动，框住条纹清楚的区域。", {class: "flicker-hint"});
+    const draw = node("button", state.flickerEditing === index ? "正在框选：在图上拖动" : "框选条纹区域",
+      {type: "button", class: "button quiet compact"});
+    draw.disabled = state.flickerEditing === index;
+    draw.addEventListener("click", () => {
+      state.flickerEditing = index;
+      displayFlickerSlots();
+    });
+    if (state.flickerEditing === index) {
+      wrap.classList.add("drawing");
+      wrap.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        const box = wrap.getBoundingClientRect();
+        const start = [(event.clientX - box.left) / box.width, (event.clientY - box.top) / box.height];
+        wrap.setPointerCapture(event.pointerId);
+        wrap.addEventListener("pointerup", (finish) => {
+          const end = [(finish.clientX - box.left) / box.width, (finish.clientY - box.top) / box.height];
+          const region = [Math.min(start[0], end[0]), Math.min(start[1], end[1]),
+            Math.max(start[0], end[0]), Math.max(start[1], end[1])];
+          if (region[2] - region[0] < .01 || region[3] - region[1] < .01) {
+            notice("条纹选区至少要覆盖画面宽高的 1%。", true);
+            return;
+          }
+          state.flicker[index].region = region;
+          state.flickerEditing = null;
+          persistFlicker();
+          displayFlickerSlots();
+          notice("");
+        }, {once: true});
+      });
+    }
+    const actions = node("div", null, {class: "inline-actions"});
+    actions.append(draw);
+    slot.append(actions, hint);
+  }
+  select.addEventListener("change", () => {
+    state.flicker[index].capture_id = select.value;
+    state.flicker[index].region = null;
+    if (state.flickerEditing === index) state.flickerEditing = null;
+    persistFlicker();
+    displayFlickerSlots();
+  });
+  timeInput.addEventListener("input", () => {
+    state.flicker[index].row_time_us = timeInput.value;
+    persistFlicker();
+  });
+  return slot;
+}
+
+function displayFlickerSlots() {
+  const root = $("flicker-slots");
+  if (!root || !state.panel) return;
+  const known = new Set(state.captures.map((capture) => capture.id));
+  for (const entry of state.flicker) {
+    if (entry.capture_id && !known.has(entry.capture_id)) {
+      entry.capture_id = "";
+      entry.region = null;
+    }
+  }
+  if (state.flickerEditing !== null && !state.flicker[state.flickerEditing]?.capture_id) {
+    state.flickerEditing = null;
+  }
+  if (!state.flicker.length) {
+    root.replaceChildren(node("p", "还没有加入采集。至少加入两张逐行读出设置不同的图。", {class: "muted"}));
+  } else {
+    root.replaceChildren(...state.flicker.map((entry, index) => flickerSlot(index, entry)));
+  }
+  const add = node("button", "加入一张采集（最多三张）", {type: "button", class: "button quiet compact"});
+  add.disabled = state.flicker.length >= FLICKER_SLOT_COUNT;
+  add.addEventListener("click", addFlickerSlot);
+  root.append(add);
+}
+
+function flickerRequest() {
+  const captures = [];
+  state.flicker.forEach((entry, index) => {
+    if (!entry.capture_id) throw new Error(`请为第 ${index + 1} 张选择采集图。`);
+    if (!entry.row_time_us) throw new Error(`请填写第 ${index + 1} 张的相邻两行读出时间。`);
+    if (!entry.region) throw new Error(`请在第 ${index + 1} 张上框选条纹清楚的区域。`);
+    captures.push({
+      capture_id: entry.capture_id,
+      row_time_us: Number(entry.row_time_us),
+      region: entry.region,
+    });
+  });
+  if (captures.length < 2) throw new Error("至少选择两张采集一起核对。");
+  const form = $("flicker-form");
+  const request = {captures};
+  for (const field of ["freq_min", "freq_max", "tolerance_pct", "min_strength", "min_amplitude"]) {
+    if (!form.elements[field].checkValidity()) {
+      form.elements[field].reportValidity();
+      throw new Error("频率范围或判定参数超出可用范围。");
+    }
+    request[field] = form.elements[field].valueAsNumber;
+  }
+  request.title = form.elements.title.value.trim();
+  return request;
+}
+
+async function runFlicker(save) {
+  if (!state.panel) return;
+  let body;
+  try {
+    body = flickerRequest();
+  } catch (error) {
+    notice(error.message, true);
+    return;
+  }
+  flickerBusy();
+  notice(save ? "正在保存条纹频率核对…" : "正在读取原图条纹…");
+  try {
+    const reply = await post(`/api/panels/${state.panel.id}/flicker`, {...body, save});
+    showReport($("flicker-report"), reply.result || reply, reply.record?.id);
+    notice(save ? "核对记录已保存，可在复核与交接中打开。" : "");
+    if (save) {
+      await refreshPanels();
+      displayPanel();
+      await refreshRecords();
+    }
+  } finally {
+    flickerIdle();
+  }
+}
+
 async function initialize() {
   const catalog = await json("/api/catalog");
   state.catalog = catalog;
@@ -900,6 +1188,7 @@ async function initialize() {
   }
   $("tool").replaceChildren(...themes.values());
   $("tool").value = "rectify";
+  restoreFlicker();
   await displayTool();
   await refreshPanels();
   const cached = localStorage.getItem("lumagrid.panel");
