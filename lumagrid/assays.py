@@ -4,11 +4,15 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.ndimage import binary_closing, gaussian_filter, label
 
+from .graycard import (
+    STATUS_BRACKETED, STATUS_EXTRAPOLATED, STATUS_NEAR, STATUS_UNREFERENCED,
+    correction_metrics, evidence_image, parse_gray_boxes, patch_rows, evaluate as gray_evaluate,
+)
 from .inspection import Report, Scene, make_plane, paired_plane, stable_fraction
 from .model import Problem, Region, boolean, integral, numeric
 from .raster import (
     chart_png, code_statistics, heatmap, linear_code, luma, masked_rgb, overlay_regions,
-    paired_bounds, png_bytes, rounding,
+    paired_bounds, png_bytes, resize_report, rounding, side_by_side, titled_strip,
 )
 
 
@@ -189,10 +193,33 @@ def lab_values(rgb: np.ndarray) -> np.ndarray:
     return np.stack([116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)], axis=-1)
 
 
+def _chroma_grid(first_plane, chroma_values, valid, size):
+    rows, boxes = [], []
+    for cell in partition(first_plane.shape[1], first_plane.shape[0], size, size):
+        sample = coverage_stats(cell, valid, chroma_values, .60)
+        rows.append(sample)
+        boxes.append((cell.box, str(len(rows)), (235, 241, 249) if sample["samples"] else (228, 143, 103)))
+    return rows, boxes
+
+
+def _reference_status_counts(correction, first_linear, valid, size):
+    counts = {STATUS_BRACKETED: 0, STATUS_NEAR: 0, STATUS_EXTRAPOLATED: 0, STATUS_UNREFERENCED: 0}
+    for cell in partition(first_linear.shape[1], first_linear.shape[0], size, size):
+        keep = cell.values(valid)
+        if keep.sum() < 4:
+            status = STATUS_UNREFERENCED
+        else:
+            cell_luma = float(np.median(luma(first_linear)[cell.y, cell.x][keep]))
+            status = correction.cell_status(cell_luma)
+        counts[status] += 1
+    return counts
+
+
 def color_shift(scene: Scene, second: Scene | None, region: Region, options: dict) -> Report:
     first, target, overlap = paired_plane(scene, second, region, max_side=720)
     exposure_match = boolean(options.get("neutralize"), "亮度等比例归一", default=True)
     size = integral(options.get("grid"), "网格边数", 2, 9, default=4)
+    gray_boxes = parse_gray_boxes(options.get("gray_boxes"))
     valid = overlap & first.usable(avoid_saturated=True) & target.usable(avoid_saturated=True)
     if valid.sum() < 100:
         raise Problem("两张采集中共同有效且未到码值极限的采样点不足。")
@@ -203,31 +230,105 @@ def color_shift(scene: Scene, second: Scene | None, region: Region, options: dic
     ratio = float(np.median(first_y[valid]) / max(1e-8, np.median(second_y[valid])))
     effective = ratio if exposure_match else 1.0
     scaled = second_linear * effective
-    valid &= np.max(scaled, axis=-1) <= 1
-    if valid.sum() < 100:
+    base_valid = valid & (np.max(scaled, axis=-1) <= 1)
+    base_valid = np.asarray(base_valid, dtype=bool)
+    if base_valid.sum() < 100:
         raise Problem("亮度归一后留下的未裁切像素不足。")
     delta = lab_values(scaled) - lab_values(first_linear)
     full = np.linalg.norm(delta, axis=-1)
     chroma = np.linalg.norm(delta[..., 1:], axis=-1)
     stats = {
         **first.info(),
-        "common_coverage_pct": rounding(100 * valid.mean(), 2),
+        "common_coverage_pct": rounding(100 * base_valid.mean(), 2),
         "exposure_gain": rounding(effective),
-        "relative_median_lightness": rounding(np.median(delta[..., 0][valid])),
-        "median_delta_e_76": rounding(np.median(full[valid]), 3),
-        "median_chromatic_shift": rounding(np.median(chroma[valid]), 3),
+        "relative_median_lightness": rounding(np.median(delta[..., 0][base_valid])),
+        "median_delta_e_76": rounding(np.median(full[base_valid]), 3),
+        "median_chromatic_shift": rounding(np.median(chroma[base_valid]), 3),
     }
-    rows, boxes = [], []
-    for cell in partition(first.shape[1], first.shape[0], size, size):
-        sample = coverage_stats(cell, valid, chroma, .60)
-        rows.append(sample)
-        boxes.append((cell.box, str(len(rows)), (235, 241, 249) if sample["samples"] else (228, 143, 103)))
-    scale = max(2.0, float(np.percentile(chroma[valid], 97)))
+    rows, boxes = _chroma_grid(first, chroma, base_valid, size)
+    scale = max(2.0, float(np.percentile(chroma[base_valid], 97)))
     stats["heatmap_max"] = rounding(scale, 3)
     report = Report("视角色偏比较", "在共同可见的面板区域比较两次采集的色度差。", stats, rows)
-    report.image("color-delta.png", overlay_regions(heatmap(chroma, valid, 0, scale), boxes))
-    report.table("color-cells.csv", rows)
+    base_overlay = overlay_regions(heatmap(chroma, base_valid, 0, scale), boxes)
     report.warnings.append("按 sRGB 与 D65 假设估计相对色差，未经相机／光谱校正。")
+
+    if not gray_boxes:
+        report.image("color-delta.png", base_overlay)
+        report.table("color-cells.csv", rows)
+        return report
+
+    correction = gray_evaluate(gray_boxes, scene, second)
+    report.warnings.extend(correction.warnings)
+    report.image(
+        "graycard-evidence.png",
+        evidence_image(scene, second, correction),
+    )
+    report.table("graycard-patches.csv", patch_rows(correction))
+    if not correction.available:
+        report.image("color-delta.png", base_overlay)
+        report.table("color-cells.csv", rows)
+        report.metrics.update(correction_metrics(correction))
+        return report
+
+    corrected = correction.apply(second_linear)
+    corrected_valid = (
+        valid
+        & np.all(corrected > 0, axis=-1)
+        & (np.max(corrected, axis=-1) <= 1)
+    )
+    corrected_valid = np.asarray(corrected_valid, dtype=bool)
+    if corrected_valid.sum() < 100:
+        report.image("color-delta.png", base_overlay)
+        report.table("color-cells.csv", rows)
+        report.metrics.update(correction_metrics(correction))
+        report.warnings.append(
+            "灰片校正参数使面板像素大面积超出码值范围，已放弃校正并保留未校正结果，请复核灰片框。"
+        )
+        return report
+    corrected_delta = lab_values(np.clip(corrected, 0, 1)) - lab_values(first_linear)
+    corrected_full = np.linalg.norm(corrected_delta, axis=-1)
+    corrected_chroma = np.linalg.norm(corrected_delta[..., 1:], axis=-1)
+    corrected_rows, corrected_boxes = _chroma_grid(first, corrected_chroma, corrected_valid, size)
+    reference_counts = _reference_status_counts(correction, first_linear, base_valid, size)
+    cells = list(partition(first.shape[1], first.shape[0], size, size))
+    for index, row in enumerate(rows):
+        keep = cells[index].values(base_valid)
+        if keep.sum() < 4:
+            status = STATUS_UNREFERENCED
+        else:
+            cell_luma = float(np.median(first_y[cells[index].y, cells[index].x][keep]))
+            status = correction.cell_status(cell_luma)
+        row["reference_status"] = status
+        row["uncorrected_median_chroma"] = row["median"]
+        row["median"] = corrected_rows[index]["median"]
+        row["corrected_median_chroma"] = corrected_rows[index]["median"]
+        row["corrected_samples"] = corrected_rows[index]["samples"]
+    corrected_overlay = overlay_regions(
+        heatmap(corrected_chroma, corrected_valid, 0, scale), corrected_boxes
+    )
+    report.image(
+        "color-delta-before-after.png",
+        resize_report(side_by_side(
+            titled_strip(base_overlay, "Uncorrected (global gain)"),
+            titled_strip(corrected_overlay, "Gray-card corrected"),
+        )),
+    )
+    report.image("color-delta-uncorrected.png", base_overlay)
+    report.image("color-delta-corrected.png", corrected_overlay)
+    report.table("color-cells.csv", rows)
+    report.metrics.update(correction_metrics(correction))
+    report.metrics.update({
+        "common_coverage_pct": rounding(100 * corrected_valid.mean(), 2),
+        "corrected_median_delta_e_76": rounding(np.median(corrected_full[corrected_valid]), 3),
+        "corrected_median_chromatic_shift": rounding(
+            np.median(corrected_chroma[corrected_valid]), 3
+        ),
+        "cells_with_reference": reference_counts[STATUS_BRACKETED] + reference_counts[STATUS_NEAR],
+        "cells_bracketed": reference_counts[STATUS_BRACKETED],
+        "cells_near_anchor": reference_counts[STATUS_NEAR],
+        "cells_extrapolated": reference_counts[STATUS_EXTRAPOLATED],
+        "cells_unreferenced": reference_counts[STATUS_UNREFERENCED],
+    })
     return report
 
 
@@ -310,10 +411,12 @@ def configs():
         "color": {
             "title": "视角色偏",
             "group": "亮度与颜色",
-            "description": "对齐同一面板的两张采集，查看共同可见区域的色度漂移。",
+            "description": "对齐同一面板的两张采集，查看共同可见区域的色度漂移；可在相机原图上框亮暗两档灰片以扣除补光偏色。",
             "comparison": "required",
             "run": color_shift,
-            "options": [tick("neutralize", "亮度等比例归一", True), number("grid", "网格边数", 4, 2, 9)],
+            "options": [tick("neutralize", "亮度等比例归一", True), number("grid", "网格边数", 4, 2, 9),
+                        {"key": "gray_boxes", "label": "灰片参考框（相机原图坐标，点击右侧按钮框选）",
+                         "type": "graybox", "default": {"primary": [], "comparison": []}}],
         },
         "checker": {
             "title": "棋盘格对比",

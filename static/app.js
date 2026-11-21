@@ -7,6 +7,7 @@ const state = {
   draftResult: null, activeTab: "capture",
   records: [], record: null, checkedRecords: new Set(),
   requestSerial: 0, recordSerial: 0, currentSearch: 0,
+  grayBoxes: {primary: [], comparison: []},
 };
 
 function node(tag, text, attrs = {}) {
@@ -172,6 +173,7 @@ async function selectCapture(capture) {
   state.cornerDraft = [];
   state.startProbe = null;
   state.draftResult = null;
+  state.grayBoxes = {primary: [], comparison: []};
   $("report").hidden = true;
   $("save-report").disabled = true;
   $("revision").replaceChildren();
@@ -366,6 +368,203 @@ async function updateCompareCalibrations() {
   setOptions($("compare-revision"), revisionChoices(calibrations), calibrations[0]?.id || "identity");
 }
 
+function buildGrayBoxField(config) {
+  const wrap = node("div", null, {class: "graybox-field"});
+  wrap.append(node("span", config.label, {class: "muted"}));
+  const button = node("button", "框选灰片参考（亮灰／暗灰）", {type: "button", class: "button compact quiet"});
+  const summary = node("p", grayBoxSummary(), {class: "graybox-summary"});
+  button.addEventListener("click", () => openGrayCardDialog().catch((error) => notice(error.message, true)));
+  wrap.append(button, summary);
+  wrap.dataset.valueType = "graybox";
+  wrap.dataset.fieldKey = config.key;
+  wrap.refresh = () => { summary.textContent = grayBoxSummary(); };
+  return wrap;
+}
+
+function grayBoxSummary() {
+  const name = (level) => level === "light" ? "亮灰" : "暗灰";
+  const lines = [];
+  for (const [scene, title] of [["primary", "主采集"], ["comparison", "对照采集"]]) {
+    const boxes = state.grayBoxes[scene] || [];
+    lines.push(boxes.length
+      ? `${title}：${boxes.map((box) => name(box.level)).join("、")}`
+      : `${title}：未框灰片`);
+  }
+  return lines.join("\n");
+}
+
+const grayCard = {
+  scene: null,
+  level: null,
+  start: null,
+  pending: null,
+};
+
+function grayCardDialogNode(selector) {
+  return $("graycard-dialog").querySelector(selector);
+}
+
+function grayCardSvg(scene) {
+  return grayCardDialogNode(`.graycard-stage[data-scene="${scene}"] .graycard-overlay`);
+}
+
+function grayPoint(event, stage) {
+  const bounds = stage.querySelector("img").getBoundingClientRect();
+  return [
+    Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
+    Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)),
+  ];
+}
+
+function grayRectPoints(box) {
+  return [[box.left, box.top], [box.right, box.top], [box.right, box.bottom], [box.left, box.bottom]];
+}
+
+function drawGrayBoxes() {
+  for (const scene of ["primary", "comparison"]) {
+    const svg = grayCardSvg(scene);
+    svg.replaceChildren();
+    for (const box of state.grayBoxes[scene]) {
+      const points = grayRectPoints(box).map(([x, y]) => `${x * 1000},${y * 1000}`).join(" ");
+      svg.append(svgEl("polygon", {points, class: box.level === "dark" ? "dark" : ""}));
+      const anchor = grayRectPoints(box)[0];
+      const text = svgEl("text", {x: anchor[0] * 1000 + 6, y: anchor[1] * 1000 + 30});
+      text.textContent = box.level === "light" ? "L" : "D";
+      svg.append(text);
+    }
+    if (grayCard.scene === scene && grayCard.pending) {
+      const draft = grayRectPoints(grayCard.pending).map(([x, y]) => `${x * 1000},${y * 1000}`).join(" ");
+      svg.append(svgEl("polygon", {points: draft, class: grayCard.level === "dark" ? "dark" : ""}));
+    }
+  }
+  for (const scene of ["primary", "comparison"]) {
+    grayCardDialogNode(`.graycard-status[data-status="${scene}"]`).textContent =
+      grayStatusText(scene);
+    grayCardDialogNodeAll(`.graycard-card[data-scene="${scene}"] button[data-level]`).forEach((btn) => {
+      const active = grayCard.scene === scene && grayCard.level === btn.dataset.level;
+      btn.setAttribute("aria-pressed", String(active));
+      btn.textContent = `${btn.dataset.level === "light" ? "框亮灰档" : "框暗灰档"}${active ? "（画矩形中）" : ""}`;
+    });
+  }
+  $("graycard-message").textContent = grayCard.level
+    ? `正在${grayCard.level === "light" ? "亮灰" : "暗灰"}档：在${grayCard.scene === "primary" ? "主" : "对照"}图上按下并拖动画矩形。`
+    : "选择某一档按钮后在图上拖动画矩形；反光、出画或裁开的部分不要框入。";
+}
+
+function grayCardDialogNodeAll(selector) {
+  return [...$("graycard-dialog").querySelectorAll(selector)];
+}
+
+function grayStatusText(scene) {
+  const boxes = state.grayBoxes[scene];
+  if (!boxes.length) return "未框选。";
+  return boxes.map((box) => `${box.level === "light" ? "亮灰" : "暗灰"} `
+    + `[${box.left.toFixed(3)}, ${box.top.toFixed(3)}, ${box.right.toFixed(3)}, ${box.bottom.toFixed(3)}]`).join("　");
+}
+
+async function openGrayCardDialog() {
+  if (!state.capture) throw new Error("请先选择采集图。");
+  const comparisonId = $("comparison")?.value;
+  if (toolSpec()?.comparison && !comparisonId) {
+    throw new Error("请先选择对照采集，再框选灰片。");
+  }
+  grayCard.scene = null;
+  grayCard.level = null;
+  grayCard.start = null;
+  grayCard.pending = null;
+  const comparison = state.captures.find((item) => item.id === comparisonId);
+  $("graycard-primary-title").textContent = state.capture.title;
+  $("graycard-primary-img").src = `/api/captures/${state.capture.id}/image/preview`;
+  if (comparison) {
+    $("graycard-comparison-title").textContent = comparison.title;
+    $("graycard-comparison-img").src = `/api/captures/${comparison.id}/image/preview`;
+  }
+  grayCardDialogNodeAll(".graycard-card").forEach((card) => {
+    card.hidden = card.dataset.scene === "comparison" && !comparison;
+  });
+  drawGrayBoxes();
+  $("graycard-dialog").showModal();
+}
+
+grayCardDialogNodeAll(".graycard-card button[data-level]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const card = button.closest(".graycard-card");
+    grayCard.scene = card.dataset.scene;
+    grayCard.level = button.dataset.level;
+    grayCard.start = null;
+    grayCard.pending = null;
+    drawGrayBoxes();
+  });
+});
+grayCardDialogNodeAll(".graycard-card button[data-clear]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const scene = button.closest(".graycard-card").dataset.scene;
+    state.grayBoxes[scene] = [];
+    if (grayCard.scene === scene) {
+      grayCard.level = null;
+      grayCard.pending = null;
+    }
+    drawGrayBoxes();
+  });
+});
+grayCardDialogNodeAll(".graycard-stage").forEach((stage) => {
+  stage.addEventListener("pointerdown", (event) => {
+    if (!grayCard.level || event.button !== 0) return;
+    if (stage.dataset.scene !== grayCard.scene) return;
+    event.preventDefault();
+    grayCard.start = grayPoint(event, stage);
+    grayCard.pending = null;
+    stage.setPointerCapture(event.pointerId);
+    stage.classList.add("drawing");
+  });
+  stage.addEventListener("pointermove", (event) => {
+    if (!grayCard.start || stage.dataset.scene !== grayCard.scene) return;
+    const [x, y] = grayPoint(event, stage);
+    grayCard.pending = {
+      level: grayCard.level,
+      left: Math.min(grayCard.start[0], x),
+      top: Math.min(grayCard.start[1], y),
+      right: Math.max(grayCard.start[0], x),
+      bottom: Math.max(grayCard.start[1], y),
+    };
+    drawGrayBoxes();
+  });
+  stage.addEventListener("pointerup", (event) => {
+    if (!grayCard.start || stage.dataset.scene !== grayCard.scene) return;
+    stage.classList.remove("drawing");
+    const box = grayCard.pending;
+    grayCard.start = null;
+    grayCard.pending = null;
+    if (!box || box.right - box.left < .008 || box.bottom - box.top < .008) {
+      drawGrayBoxes();
+      notice("灰片框太小，请在相机原图上框出更大的灰片区域。", true);
+      return;
+    }
+    const scene = grayCard.scene;
+    state.grayBoxes[scene] = state.grayBoxes[scene].filter((item) => item.level !== box.level);
+    state.grayBoxes[scene].push(box);
+    drawGrayBoxes();
+  });
+});
+on("graycard-confirm", "click", () => {
+  const total = state.grayBoxes.primary.length + state.grayBoxes.comparison.length;
+  if (total && !(state.grayBoxes.primary.length && state.grayBoxes.comparison.length)) {
+    notice("两张相机原图都要框灰片；某张没有可靠档位时请在另一张也保持一致或全部清除。", true);
+    return;
+  }
+  document.querySelectorAll("[data-value-type=graybox]").forEach((field) => field.refresh?.());
+  invalidateDraft();
+  $("graycard-dialog").close();
+  notice(total ? "灰片框已记录，运行检查时会按可靠档位做校正并在报告中标注参照状态。" : "未使用灰片，运行原亮度归一比较。");
+});
+on("graycard-cancel", "click", () => $("graycard-dialog").close());
+on("graycard-reset-all", "click", () => {
+  state.grayBoxes = {primary: [], comparison: []};
+  grayCard.level = null;
+  grayCard.pending = null;
+  drawGrayBoxes();
+});
+
 function buildField(config) {
   const {label, type, key, default: initial} = config;
   const wrap = node("label", label);
@@ -376,6 +575,8 @@ function buildField(config) {
   } else if (type === "json") {
     field = node("textarea", null, {rows: "5", spellcheck: "false"});
     field.value = JSON.stringify(initial ?? null, null, 2);
+  } else if (type === "graybox") {
+    return buildGrayBoxField(config);
   } else {
     field = node("input", null, {type});
     if (type === "checkbox") {
@@ -402,6 +603,7 @@ async function displayTool() {
   $("compare-field").hidden = !tool.comparison;
   $("options").replaceChildren(...tool.options.map(buildField));
   state.region = null;
+  state.grayBoxes = {primary: [], comparison: []};
   drawOverlay();
   fillComparison();
   invalidateDraft();
@@ -421,7 +623,10 @@ function currentRequest() {
   for (const field of $("options").querySelectorAll("[data-value-type]")) {
     const type = field.dataset.valueType;
     if (type === "checkbox") options[field.name] = field.checked;
-    else if (type === "json") {
+    else if (type === "graybox") {
+      options[field.dataset.fieldKey] = state.grayBoxes.primary.length || state.grayBoxes.comparison.length
+        ? state.grayBoxes : {primary: [], comparison: []};
+    } else if (type === "json") {
       try {
         options[field.name] = JSON.parse(field.value);
       } catch {
@@ -489,6 +694,21 @@ const labels = {
   dry_patches: "样本格数", source_error_x_px: "横向误差 px", source_error_y_px: "纵向误差 px",
   panel_mm: "面板毫米长度", panel_px: "面板物理像素长度", source_px: "原相机像素长度",
   dark_capture_id: "暗场标识", flat_capture_id: "平场标识", fit_rmse: "拟合均方根误差",
+  graycard_mode: "灰片校正方式", graycard_reliable_levels: "可靠灰片档位",
+  graycard_reference_luma: "参考档线性亮度", graycard_gains_rgb: "每通道增益 R/G/B",
+  graycard_offsets_rgb: "每通道偏移 R/G/B",
+  corrected_median_delta_e_76: "校正后中位 ΔE76",
+  corrected_median_chromatic_shift: "校正后中位色度差",
+  cells_with_reference: "有参照网格", cells_bracketed: "夹在双档之间网格",
+  cells_near_anchor: "靠近参考档网格", cells_extrapolated: "档外外推网格",
+  cells_unreferenced: "无参照网格", reference_status: "灰片参照状态",
+  uncorrected_median_chroma: "校正前中位色度差", corrected_median_chroma: "校正后中位色度差",
+  corrected_samples: "校正后样本",
+  scene: "采集", gray_level: "灰片档位", box_left: "框左", box_top: "框上",
+  box_right: "框右", box_bottom: "框下", usable: "是否采用", reason: "未采用原因",
+  clipped_pct: "触限像素 %", uniform_cv: "均匀度变异系数",
+  median_linear_r: "线性 R 中位", median_linear_g: "线性 G 中位", median_linear_b: "线性 B 中位",
+  median_linear_luma: "线性亮度中位", inlier_samples: "稳健样本",
 };
 
 function valueText(value) {
@@ -697,7 +917,12 @@ on("capture-filter", "input", displayCaptureList);
 on("record-filter", "input", refreshRecords);
 on("tool", "change", displayTool);
 on("options", "input", invalidateDraft);
-on("comparison", "change", async () => { invalidateDraft(); await updateCompareCalibrations(); });
+on("comparison", "change", async () => {
+  invalidateDraft();
+  state.grayBoxes = {primary: [], comparison: []};
+  document.querySelectorAll("[data-value-type=graybox]").forEach((field) => field.refresh?.());
+  await updateCompareCalibrations();
+});
 on("compare-revision", "change", invalidateDraft);
 on("revision", "change", () => { invalidateDraft(); drawOverlay(); });
 on("preview", "click", () => runReport(false));

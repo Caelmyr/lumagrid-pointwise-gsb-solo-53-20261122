@@ -185,5 +185,45 @@
       <div class="inline-actions"><button class="button primary">导入图像</button><button class="button quiet" type="button" data-close="capture-dialog">取消</button></div>
     </form>
   </dialog>
+  <dialog id="graycard-dialog">
+    <form class="dialog-form graycard-form" id="graycard-form" method="dialog">
+      <h2>框选灰片参考</h2>
+      <p class="muted">在每张相机原图上分别框亮灰、暗灰两档（拖动画矩形）。灰片上的反光、出画或裁开区域请不要框入；若只有一档可靠，只框该档即可。</p>
+      <div class="graycard-grid">
+        <figure class="graycard-card" data-scene="primary">
+          <figcaption>主采集 · <span id="graycard-primary-title"></span></figcaption>
+          <div class="graycard-stage" data-scene="primary">
+            <img id="graycard-primary-img" alt="主采集相机原图">
+            <svg viewBox="0 0 1000 1000" preserveAspectRatio="none" class="graycard-overlay" aria-hidden="true"></svg>
+          </div>
+          <div class="inline-actions">
+            <button type="button" class="button compact quiet" data-level="light">框亮灰档</button>
+            <button type="button" class="button compact quiet" data-level="dark">框暗灰档</button>
+            <button type="button" class="button compact quiet" data-clear>清除本图</button>
+          </div>
+          <p class="graycard-status muted" data-status="primary"></p>
+        </figure>
+        <figure class="graycard-card" data-scene="comparison">
+          <figcaption>对照采集 · <span id="graycard-comparison-title"></span></figcaption>
+          <div class="graycard-stage" data-scene="comparison">
+            <img id="graycard-comparison-img" alt="对照采集相机原图">
+            <svg viewBox="0 0 1000 1000" preserveAspectRatio="none" class="graycard-overlay" aria-hidden="true"></svg>
+          </div>
+          <div class="inline-actions">
+            <button type="button" class="button compact quiet" data-level="light">框亮灰档</button>
+            <button type="button" class="button compact quiet" data-level="dark">框暗灰档</button>
+            <button type="button" class="button compact quiet" data-clear>清除本图</button>
+          </div>
+          <p class="graycard-status muted" data-status="comparison"></p>
+        </figure>
+      </div>
+      <p id="graycard-message" class="muted" role="status"></p>
+      <div class="inline-actions">
+        <button type="button" class="button primary" id="graycard-confirm">使用这些灰片框</button>
+        <button type="button" class="button quiet" id="graycard-cancel">取消</button>
+        <button type="button" class="button quiet" id="graycard-reset-all">全部清除</button>
+      </div>
+    </form>
+  </dialog>
 </body>
 </html>

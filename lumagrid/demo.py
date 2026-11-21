@@ -28,6 +28,26 @@ CORNERS = (
     ((-.027, .119), (.872, .097), (.921, .885), (-.038, .893)),
 )
 
+# Reference gray cards standing outside the panel quad, in camera-normalized
+# coordinates. Each pose carries the same light/dark physical card so the two
+# viewpoints can be color-corrected against the card instead of global gain.
+GRAY_CARDS = {
+    0: {
+        "light": (.012, .180, .072, .300),
+        "dark": (.012, .335, .072, .455),
+        "tint": (1.000, 1.000, 1.000),
+        "glare": None,
+    },
+    1: {
+        "light": (.012, .180, .072, .300),
+        "dark": (.012, .335, .072, .455),
+        "tint": (1.150, 1.020, .820),
+        "glare": ("light", .40, .25, .013, .050, .22),
+    },
+}
+CARD_LIGHT_REFLECTANCE = .62
+CARD_DARK_REFLECTANCE = .18
+
 
 @dataclass(frozen=True)
 class DemoSource:
@@ -226,6 +246,25 @@ def synth_macro(seed: int) -> np.ndarray:
     return np.clip(photo + noise, 0, 1)
 
 
+def paint_gray_cards(camera: np.ndarray, x: np.ndarray, y: np.ndarray, plan: dict) -> np.ndarray:
+    result = camera.copy()
+    for level, reflectance in (("light", CARD_LIGHT_REFLECTANCE), ("dark", CARD_DARK_REFLECTANCE)):
+        left, top, right, bottom = plan[level]
+        inside = (x >= left) & (x <= right) & (y >= top) & (y <= bottom)
+        result[inside] = reflectance
+    glare = plan.get("glare")
+    if glare is not None:
+        level, cx, cy, sx, sy, amplitude = glare
+        left, top, right, bottom = plan[level]
+        streak = amplitude * bump(x, y, cx, cy, sx, sy)
+        inside = (x >= left) & (x <= right) & (y >= top) & (y <= bottom)
+        result[inside] += streak[inside][..., None]
+    # The fill-light tint covers the whole viewpoint: panel, environment and
+    # cards alike, so a card-derived correction also applies to the panel.
+    tint = np.asarray(plan["tint"], dtype=np.float32)
+    return result * tint
+
+
 def synth_capture(source: DemoSource):
     if source.photo in {"dark", "flat"}:
         photo = sensor_reference(source.photo, source.seed)
@@ -240,6 +279,9 @@ def synth_capture(source: DemoSource):
     v = np.clip(uv[..., 1], 0, 1)
     rendered = optics_panel(source.photo, u, v)
     camera = np.where(valid_panel[..., None], rendered, panel_environment(x, y))
+    card_plan = GRAY_CARDS.get(source.pose)
+    if card_plan is not None:
+        camera = paint_gray_cards(camera, x, y, card_plan)
     camera = gain * camera + bias
     noise = np.random.default_rng(source.seed).normal(0, .0025, camera.shape)
     camera = gaussian_filter(camera, (.56, .56, 0)) + noise

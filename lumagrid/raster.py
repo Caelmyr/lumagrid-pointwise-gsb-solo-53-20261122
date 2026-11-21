@@ -230,6 +230,15 @@ def side_by_side(first: Image.Image, second: Image.Image, gap: int = 7) -> Image
     return result
 
 
+def titled_strip(image: Image.Image, title: str, *, height: int = 26) -> Image.Image:
+    bar = Image.new("RGB", (image.width, height), (21, 35, 46))
+    ImageDraw.Draw(bar).text((8, 6), title, fill=(220, 229, 237))
+    combined = Image.new("RGB", (image.width, image.height + height), (21, 35, 46))
+    combined.paste(bar, (0, 0))
+    combined.paste(image, (0, height))
+    return combined
+
+
 def chart_png(
     series: list[tuple[str, np.ndarray, np.ndarray]],
     *,
