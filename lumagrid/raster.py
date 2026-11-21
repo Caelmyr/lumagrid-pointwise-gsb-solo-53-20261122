@@ -223,6 +223,21 @@ def overlay_regions(
     return result
 
 
+def link_regions(
+    image: Image.Image,
+    links: list[tuple[tuple[float, float, float, float], tuple[float, float, float, float]]],
+    color=(245, 240, 220),
+) -> Image.Image:
+    result = image.copy()
+    draw = ImageDraw.Draw(result)
+    width, height = result.size
+    for first, second in links:
+        start = ((first[0] + first[2]) / 2 * width, (first[1] + first[3]) / 2 * height)
+        end = ((second[0] + second[2]) / 2 * width, (second[1] + second[3]) / 2 * height)
+        draw.line([start, end], fill=color, width=2)
+    return result
+
+
 def side_by_side(first: Image.Image, second: Image.Image, gap: int = 7) -> Image.Image:
     result = Image.new("RGB", (first.width + second.width + gap, max(first.height, second.height)), (21, 35, 46))
     result.paste(first, (0, 0))

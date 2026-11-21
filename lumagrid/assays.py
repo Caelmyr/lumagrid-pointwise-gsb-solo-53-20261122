@@ -5,10 +5,10 @@ import numpy as np
 from scipy.ndimage import binary_closing, gaussian_filter, label
 
 from .inspection import Report, Scene, make_plane, paired_plane, stable_fraction
-from .model import Problem, Region, boolean, integral, numeric
+from .model import Problem, Region, boolean, choice, integral, numeric
 from .raster import (
-    chart_png, code_statistics, heatmap, linear_code, luma, masked_rgb, overlay_regions,
-    paired_bounds, png_bytes, rounding,
+    chart_png, code_statistics, heatmap, linear_code, link_regions, luma, masked_rgb,
+    overlay_regions, paired_bounds, png_bytes, rounding,
 )
 
 
@@ -231,30 +231,62 @@ def color_shift(scene: Scene, second: Scene | None, region: Region, options: dic
     return report
 
 
+def blocked_cells(value, columns: int, rows: int) -> set:
+    if value is None:
+        return set()
+    if not isinstance(value, (list, tuple)) or len(value) > columns * rows:
+        raise Problem("遮挡格应为 [行, 列] 组成的数组。")
+    blocked = set()
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise Problem("遮挡格每项应写作 [行, 列]。")
+        blocked.add((integral(item[0], "遮挡格行号", 1, rows),
+                     integral(item[1], "遮挡格列号", 1, columns)))
+    return blocked
+
+
 def checker_contrast(scene: Scene, second: Scene | None, region: Region, options: dict) -> Report:
     scene.require_role({"checker"}, "请选择棋盘格采集。")
     columns = integral(options.get("columns"), "棋盘列数", 2, 24, default=6)
     rows = integral(options.get("rows"), "棋盘行数", 2, 24, default=4)
     inset = numeric(options.get("guard"), "格内边缘忽略比例", 0, .36, default=.14)
     first_light = boolean(options.get("first_light"), "左上角为亮格", default=True)
+    blocked = blocked_cells(options.get("blocked"), columns, rows)
+    mode = choice(options.get("mode"), {"paired", "aggregate"}, "对比方式", default="paired")
     plane = make_plane(scene, region)
     plane.require_coverage(.22)
     gray = luma(linear_code(plane.rgb))
+    cells = []
+    for cell in partition(plane.shape[1], plane.shape[0], columns, rows, inset):
+        light = ((cell.column + cell.row) % 2 == 0) == first_light
+        summary = coverage_stats(cell, plane.observed, gray, .72)
+        summary["expected"] = "white" if light else "black"
+        cells.append({
+            "row": cell.row, "column": cell.column, "light": light, "box": cell.box,
+            "blocked": (cell.row + 1, cell.column + 1) in blocked, "summary": summary,
+        })
+    if mode == "aggregate":
+        return checker_aggregate(plane, cells, blocked)
+    return checker_paired(plane, cells, blocked)
+
+
+def checker_aggregate(plane, cells: list, blocked: set) -> Report:
     measured = []
     kept = {True: [], False: []}
     boxes = []
-    for cell in partition(plane.shape[1], plane.shape[0], columns, rows, inset):
-        light = (cell.column + cell.row) % 2 == 0
-        light = light == first_light
-        summary = coverage_stats(cell, plane.observed, gray, .72)
-        summary["expected"] = "white" if light else "black"
+    for cell in cells:
+        light, summary = cell["light"], cell["summary"]
+        if cell["blocked"]:
+            summary = {**summary, "state": "夹具遮挡"}
+            boxes.append((cell["box"], "挡", (228, 143, 103)))
+        else:
+            if summary["median"] is not None:
+                kept[light].append(summary["median"])
+            tint = (236, 200, 95) if summary["median"] is None else (
+                (232, 247, 241) if light else (98, 164, 239)
+            )
+            boxes.append((cell["box"], "W" if light else "B", tint))
         measured.append(summary)
-        if summary["median"] is not None:
-            kept[light].append(summary["median"])
-        tint = (236, 200, 95) if summary["median"] is None else (
-            (232, 247, 241) if light else (98, 164, 239)
-        )
-        boxes.append((cell.box, "W" if light else "B", tint))
     if not kept[True] or not kept[False]:
         raise Problem("有效覆盖中没有同时出现可统计的亮格和暗格。")
     bright = float(np.median(kept[True]))
@@ -271,10 +303,123 @@ def checker_contrast(scene: Scene, second: Scene | None, region: Region, options
     report = Report("同屏棋盘格对比", "按预期亮暗位置在格心取样，汇总两类格的相对对比。", metrics, measured)
     report.image("checker-grid.png", overlay_regions(masked_rgb(plane.rgb, plane.observed), boxes))
     report.table("checker-cells.csv", measured)
+    if blocked:
+        report.warnings.append(f"已按标记排除 {len(blocked)} 个夹具遮挡格。")
     if dark >= bright:
         report.warnings.append("暗格值不低于亮格，请复核起始颜色、行列数与棋盘边界。")
     if dark < 1e-8:
         report.warnings.append("暗格接近码值零，亮暗比无法从该曝光中估算。")
+    return report
+
+
+def checker_paired(plane, cells: list, blocked: set) -> Report:
+    usable = {(cell["row"], cell["column"]): cell for cell in cells
+              if not cell["blocked"] and cell["summary"]["median"] is not None}
+    steps = ((-1, 0), (0, -1), (0, 1), (1, 0))
+    neighbors = {key: [(key[0] + dr, key[1] + dc) for dr, dc in steps
+                       if (key[0] + dr, key[1] + dc) in usable]
+                 for key, cell in usable.items() if cell["light"]}
+    matched = {}
+
+    def extend(start, seen):
+        for target in neighbors[start]:
+            if target in seen:
+                continue
+            seen.add(target)
+            if target not in matched or extend(matched[target], seen):
+                matched[target] = start
+                return True
+        return False
+
+    for key in sorted(neighbors):
+        extend(key, set())
+    pairs = sorted((bright, dark) for dark, bright in matched.items())
+    if not pairs:
+        raise Problem("有效格中没有相邻的亮暗对，请检查遮挡标记、行列数与棋盘边界。")
+
+    def place(key):
+        return f"{key[0] + 1},{key[1] + 1}"
+
+    rows_out, links, used = [], [], set()
+    for index, (bright_key, dark_key) in enumerate(pairs, 1):
+        label = f"P{index}"
+        high = usable[bright_key]["summary"]["median"]
+        low = usable[dark_key]["summary"]["median"]
+        rows_out.append({
+            "pair": label, "state": "配对",
+            "white_cell": place(bright_key), "black_cell": place(dark_key),
+            "white_level": high, "black_level": low,
+            "contrast_ratio": stable_fraction(high, low),
+            "michelson": stable_fraction(high - low, high + low),
+        })
+        links.append((usable[bright_key]["box"], usable[dark_key]["box"]))
+        usable[bright_key]["pair"] = usable[dark_key]["pair"] = label
+        used.update((bright_key, dark_key))
+    cell_rows = []
+    for cell in cells:
+        key, summary = (cell["row"], cell["column"]), cell["summary"]
+        if cell["blocked"]:
+            state = "夹具遮挡"
+        elif summary["median"] is None:
+            state = "覆盖不足"
+        elif key in used:
+            state = f"配对 {cell['pair']}"
+        else:
+            state = "未配对留空"
+        cell_rows.append({**summary, "state": state, "pair": cell.get("pair", "")})
+        if key in used:
+            continue
+        entry = {"pair": "", "state": state}
+        entry["white_cell" if cell["light"] else "black_cell"] = place(key)
+        if state == "覆盖不足":
+            entry["coverage_pct"] = summary["coverage_pct"]
+        elif state == "未配对留空":
+            entry["white_level" if cell["light"] else "black_level"] = summary["median"]
+        rows_out.append(entry)
+    ratios = [row["contrast_ratio"] for row in rows_out if row.get("contrast_ratio") is not None]
+    michelsons = [row["michelson"] for row in rows_out if row.get("michelson") is not None]
+    metrics = {
+        **plane.info(),
+        "compare_mode": "就近亮暗配对",
+        "blocked_cells": len(blocked),
+        "measured_cells": len(usable),
+        "pairs": len(pairs),
+        "paired_cells": 2 * len(pairs),
+        "unpaired_cells": len(usable) - 2 * len(pairs),
+        "pair_contrast_median": rounding(np.median(ratios)) if ratios else None,
+        "pair_contrast_min": rounding(min(ratios)) if ratios else None,
+        "pair_contrast_max": rounding(max(ratios)) if ratios else None,
+        "pair_michelson_median": rounding(np.median(michelsons)) if michelsons else None,
+    }
+    boxes = []
+    for cell in cells:
+        pair = cell.get("pair")
+        if cell["blocked"]:
+            tint, text = (228, 143, 103), "挡"
+        elif pair:
+            tint = (232, 247, 241) if cell["light"] else (98, 164, 239)
+            text = pair
+        elif cell["summary"]["median"] is None:
+            tint, text = (236, 200, 95), "W" if cell["light"] else "B"
+        else:
+            tint, text = (196, 205, 214), "W" if cell["light"] else "B"
+        boxes.append((cell["box"], text, tint))
+    canvas = link_regions(masked_rgb(plane.rgb, plane.observed), links)
+    summary = "每格只与一枚相邻异色格配对，配对编号标在图上；无可信邻格的格子留空，不进入汇总。"
+    report = Report("棋盘格就近亮暗对比", summary, metrics, rows_out)
+    report.image("checker-pairs.png", overlay_regions(canvas, boxes))
+    report.table("checker-pairs.csv", rows_out)
+    report.table("checker-cells.csv", cell_rows)
+    if blocked:
+        report.warnings.append(f"已按标记排除 {len(blocked)} 个夹具遮挡格。")
+    if metrics["unpaired_cells"]:
+        report.warnings.append(f"{metrics['unpaired_cells']} 个有效格没有可信的相邻异色格，已在结果中留空。")
+    inverted = sum(1 for row in rows_out if row["state"] == "配对"
+                   and row["black_level"] >= row["white_level"])
+    if inverted:
+        report.warnings.append(f"{inverted} 对格子的暗格读数不低于亮格，请复核起始颜色、行列数与棋盘边界。")
+    if len(ratios) < len(pairs):
+        report.warnings.append("存在暗格接近码值零的配对，对应亮暗比记为空。")
     return report
 
 
@@ -318,11 +463,17 @@ def configs():
         "checker": {
             "title": "棋盘格对比",
             "group": "亮度与颜色",
-            "description": "从棋盘格漫反射采集提取亮暗格，避开格线邻接污染。",
+            "description": "从棋盘格漫反射采集提取亮暗格，可就近配对或整图汇总，支持标记夹具遮挡格。",
             "run": checker_contrast,
-            "options": [number("columns", "棋盘列数", 6, 2, 24),
+            "cell_marking": True,
+            "options": [{"key": "mode", "label": "对比方式", "type": "select",
+                         "values": {"paired": "就近亮暗配对", "aggregate": "整图亮暗汇总"},
+                         "default": "paired"},
+                        number("columns", "棋盘列数", 6, 2, 24),
                         number("rows", "棋盘行数", 4, 2, 24),
                         number("guard", "格内边缘忽略比例", .14, 0, .36, .01),
-                        tick("first_light", "左上角为亮格", True)],
+                        tick("first_light", "左上角为亮格", True),
+                        {"key": "blocked", "label": "夹具遮挡格 [行,列]，可点「标出遮挡格」在图上点选",
+                         "type": "json", "default": []}],
         },
     }

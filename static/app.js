@@ -3,7 +3,7 @@ const state = {
   catalog: {roles: {}, tools: [], review_states: {}},
   panels: [], panel: null, captures: [], capture: null,
   calibrations: [], compareCalibrations: [], region: null,
-  edit: null, cornerDraft: [], startProbe: null,
+  edit: null, cornerDraft: [], startProbe: null, blockedCells: new Set(),
   draftResult: null, activeTab: "capture",
   records: [], record: null, checkedRecords: new Set(),
   requestSerial: 0, recordSerial: 0, currentSearch: 0,
@@ -171,6 +171,7 @@ async function selectCapture(capture) {
   state.edit = null;
   state.cornerDraft = [];
   state.startProbe = null;
+  state.blockedCells = new Set();
   state.draftResult = null;
   $("report").hidden = true;
   $("save-report").disabled = true;
@@ -271,6 +272,7 @@ function drawOverlay() {
   $("image-wrap").classList.toggle("editing", Boolean(state.edit));
   $("edit-corners").setAttribute("aria-pressed", String(state.edit === "corners"));
   $("select-region").setAttribute("aria-pressed", String(state.edit === "region"));
+  $("mark-blocks").setAttribute("aria-pressed", String(state.edit === "blocks"));
   if (!state.capture) {
     $("region-readout").hidden = true;
     return;
@@ -288,7 +290,25 @@ function drawOverlay() {
     const rect = svgEl("polygon", {points: csv(selection), "stroke-dasharray": "6 4"});
     svg.append(rect);
   }
+  const grid = checkerGrid();
+  if (grid && (state.edit === "blocks" || state.blockedCells.size)) {
+    const transform = homography(UNIT, cornerPoints());
+    const [left, top, right, bottom] = grid.region;
+    for (let row = 0; row < grid.rows; row++) {
+      for (let column = 0; column < grid.columns; column++) {
+        const blocked = state.blockedCells.has(`${row + 1},${column + 1}`);
+        if (state.edit !== "blocks" && !blocked) continue;
+        const x0 = left + (right - left) * column / grid.columns;
+        const x1 = left + (right - left) * (column + 1) / grid.columns;
+        const y0 = top + (bottom - top) * row / grid.rows;
+        const y1 = top + (bottom - top) * (row + 1) / grid.rows;
+        const corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map((point) => remap(transform, point));
+        svg.append(svgEl("polygon", {points: csv(corners), class: blocked ? "blocked-cell" : "grid-cell"}));
+      }
+    }
+  }
   const message = state.edit === "region" ? "在画面拖动以选取范围，或连续点选两端。" :
+    state.edit === "blocks" ? "在图上点击夹具挡住的棋盘格，再次点击取消标记；行列数以当前选项为准。" :
     state.region ? `面板选区 ${state.region.map((x) => x.toFixed(3)).join(" / ")} · ${toolSpec()?.coordinate_space === "camera" ? "相机" : "面板"}归一化坐标` : "分析范围：整张面板";
   $("region-readout").hidden = false;
   $("region-readout").textContent = message;
@@ -319,6 +339,51 @@ function setRegion(first, last) {
   notice("");
 }
 
+function checkerGrid() {
+  if (!toolSpec()?.cell_marking || !state.capture) return null;
+  const read = (name, fallback) => {
+    const value = $("options").querySelector(`[name=${name}]`)?.valueAsNumber;
+    return Number.isInteger(value) && value >= 2 && value <= 24 ? value : fallback;
+  };
+  return {columns: read("columns", 6), rows: read("rows", 4), region: state.region || [0, 0, 1, 1]};
+}
+
+function syncBlockedField() {
+  const field = $("options").querySelector("[name=blocked]");
+  if (!field) return;
+  try {
+    const parsed = JSON.parse(field.value || "[]");
+    if (Array.isArray(parsed)) {
+      state.blockedCells = new Set(parsed.filter((cell) => Array.isArray(cell) && cell.length === 2)
+        .map(([row, column]) => `${row},${column}`));
+    }
+  } catch { /* 输入中途的无效 JSON 保留现状 */ }
+}
+
+function writeBlockedField() {
+  const field = $("options").querySelector("[name=blocked]");
+  if (!field) return;
+  const list = [...state.blockedCells].map((item) => item.split(",").map(Number))
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  field.value = JSON.stringify(list);
+}
+
+function toggleBlockedCell(point) {
+  const grid = checkerGrid();
+  if (!grid) return;
+  const [px, py] = remap(homography(cornerPoints(), UNIT), point);
+  const [left, top, right, bottom] = grid.region;
+  const u = (px - left) / (right - left);
+  const v = (py - top) / (bottom - top);
+  if (u < 0 || u >= 1 || v < 0 || v >= 1) return;
+  const key = `${Math.floor(v * grid.rows) + 1},${Math.floor(u * grid.columns) + 1}`;
+  if (state.blockedCells.has(key)) state.blockedCells.delete(key);
+  else state.blockedCells.add(key);
+  writeBlockedField();
+  invalidateDraft();
+  drawOverlay();
+}
+
 let pointerStart;
 $("image-wrap").addEventListener("pointerdown", (ev) => {
   if (!state.edit || ev.button !== 0) return;
@@ -335,6 +400,8 @@ $("image-wrap").addEventListener("pointerup", (ev) => {
     if (state.cornerDraft.length === 4) state.cornerDraft = [];
     state.cornerDraft.push(p);
     drawOverlay();
+  } else if (state.edit === "blocks") {
+    toggleBlockedCell(p);
   } else if (Math.hypot(p[0] - previous[0], p[1] - previous[1]) > .012) {
     setRegion(previous, p);
   } else if (state.startProbe) {
@@ -401,6 +468,9 @@ async function displayTool() {
   $("tool-description").textContent = tool.description;
   $("compare-field").hidden = !tool.comparison;
   $("options").replaceChildren(...tool.options.map(buildField));
+  $("mark-blocks").hidden = !tool.cell_marking;
+  if (state.edit === "blocks" && !tool.cell_marking) state.edit = null;
+  state.blockedCells = new Set();
   state.region = null;
   drawOverlay();
   fillComparison();
@@ -425,7 +495,7 @@ function currentRequest() {
       try {
         options[field.name] = JSON.parse(field.value);
       } catch {
-        throw new Error("检查点数组不是有效 JSON。");
+        throw new Error(`选项「${field.name}」不是有效 JSON。`);
       }
     } else if (type === "number") {
       if (!field.checkValidity()) {
@@ -483,6 +553,11 @@ const labels = {
   dimmest_cell: "最暗网格", brightest_cell: "最亮网格", scale: "采用尺度", heatmap_range: "热图标尺",
   contrast_ratio: "亮暗比", michelson: "米氏对比度", white_cells: "亮格数", black_cells: "暗格数",
   white_level: "亮格中位数", black_level: "暗格中位数", mtf50_cycles_per_sample: "MTF50 周期／采样",
+  compare_mode: "对比方式", blocked_cells: "遮挡格数", measured_cells: "有效格数", pairs: "亮暗对数",
+  paired_cells: "纳入配对格数", unpaired_cells: "留空格数", pair_contrast_median: "配对亮暗比中位数",
+  pair_contrast_min: "最小配对亮暗比", pair_contrast_max: "最大配对亮暗比",
+  pair_michelson_median: "配对米氏对比中位数", pair: "配对", state: "状态",
+  white_cell: "亮格位置", black_cell: "暗格位置", expected: "预期",
   mtf10_cycles_per_sample: "MTF10 周期／采样", dark_title: "暗场", flat_title: "平场",
   source_covered_pct: "校正覆盖 %", clipped_pct: "裁切 %", matched_pairs: "配对数", clock_offset_ms: "时钟偏移毫秒",
   unmatched_frames: "未匹配采集", unmatched_reference: "未匹配事件", rms_residual_ms: "对时均方根毫秒",
@@ -696,7 +771,13 @@ on("panel-search", "input", refreshPanels);
 on("capture-filter", "input", displayCaptureList);
 on("record-filter", "input", refreshRecords);
 on("tool", "change", displayTool);
-on("options", "input", invalidateDraft);
+on("options", "input", () => {
+  if (toolSpec()?.cell_marking) {
+    syncBlockedField();
+    drawOverlay();
+  }
+  invalidateDraft();
+});
 on("comparison", "change", async () => { invalidateDraft(); await updateCompareCalibrations(); });
 on("compare-revision", "change", invalidateDraft);
 on("revision", "change", () => { invalidateDraft(); drawOverlay(); });
@@ -760,6 +841,11 @@ on("save-corners", "click", async () => {
 });
 on("select-region", "click", () => {
   state.edit = state.edit === "region" ? null : "region";
+  state.startProbe = null;
+  drawOverlay();
+});
+on("mark-blocks", "click", () => {
+  state.edit = state.edit === "blocks" ? null : "blocks";
   state.startProbe = null;
   drawOverlay();
 });
